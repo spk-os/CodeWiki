@@ -18,6 +18,9 @@ MAX_DEPTH = 2
 DEFAULT_MAX_TOKENS = 32_768
 DEFAULT_MAX_TOKEN_PER_MODULE = 36_369
 DEFAULT_MAX_TOKEN_PER_LEAF_MODULE = 16_000
+DEFAULT_LLM_TIMEOUT = 1200   # 20 minutes
+DEFAULT_LLM_MAX_RETRIES = 10
+DEFAULT_LLM_RETRY_INTERVAL = 60  # 1 minute
 # Legacy constants (for backward compatibility)
 MAX_TOKEN_PER_MODULE = DEFAULT_MAX_TOKEN_PER_MODULE
 MAX_TOKEN_PER_LEAF_MODULE = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE
@@ -72,7 +75,85 @@ class Config:
     max_token_per_leaf_module: int = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE
     # Agent instructions for customization
     agent_instructions: Optional[Dict[str, Any]] = None
-    
+    # Multi-key concurrency / proxy / checkpoint
+    api_keys: str = ""
+    concurrency: int = 0
+    disable_proxy: bool = True
+    cache_dir: str = ".codewiki_cache"
+    resume: bool = True
+    # Model context window limit (in tokens). Prompts exceeding this limit
+    # are automatically truncated.  Defaults to 0 (auto-detect from model
+    # name), set explicitly for proxy setups where the actual model's
+    # context limit differs from the model name's known limit.
+    model_context_window: int = 0
+    # LLM call resilience
+    llm_timeout: int = DEFAULT_LLM_TIMEOUT
+    llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
+    llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL
+
+    def __post_init__(self):
+        # When multi-key api_keys is configured but llm_api_key is empty or
+        # contains the full comma-separated string, populate llm_api_key with
+        # the first individual key so OpenAI/litellm clients get a valid
+        # single key for authentication.
+        keys = [k.strip() for k in (self.api_keys or "").split(",") if k.strip()]
+        if keys:
+            if not self.llm_api_key or "," in self.llm_api_key:
+                self.llm_api_key = keys[0]
+
+    @property
+    def effective_keys(self) -> List[str]:
+        """Return de-duplicated, non-empty API keys.
+
+        Prefers ``api_keys`` (comma-separated) over the single ``llm_api_key``.
+        """
+        raw = self.api_keys or ""
+        parts = [p.strip() for p in raw.split(",") if p and p.strip()]
+        if not parts and self.llm_api_key:
+            parts = [self.llm_api_key.strip()]
+        seen = set()
+        result: List[str] = []
+        for p in parts:
+            if p and p not in seen:
+                seen.add(p)
+                result.append(p)
+        return result
+
+    @property
+    def effective_concurrency(self) -> int:
+        if self.concurrency and self.concurrency > 0:
+            return self.concurrency
+        return max(1, len(self.effective_keys))
+
+    MODEL_CONTEXT_MAP = {
+        "deepseek-v4-flash-free": 1048565,
+        "deepseek-ai/deepseek-v4-pro": 1048565,
+        "deepseek-chat": 128000,
+        "deepseek-reasoner": 128000,
+        "claude-sonnet-4": 200000,
+        "claude-opus-4": 200000,
+        "gpt-4": 128000,
+        "gpt-4-turbo": 128000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+    }
+
+    @property
+    def effective_context_window(self) -> int:
+        """Return the model context window in tokens.
+
+        Uses ``model_context_window`` if explicitly set (> 0), otherwise
+        looks up the model name in the known context map, falling back to
+        128000 (a conservative default) if not found.
+        """
+        if self.model_context_window and self.model_context_window > 0:
+            return self.model_context_window
+        model = self.main_model or ""
+        for known_name, ctx in self.MODEL_CONTEXT_MAP.items():
+            if known_name in model:
+                return ctx
+        return 128000
+
     @property
     def include_patterns(self) -> Optional[List[str]]:
         """Get file include patterns from agent instructions."""
@@ -172,7 +253,16 @@ class Config:
         max_token_per_module: int = DEFAULT_MAX_TOKEN_PER_MODULE,
         max_token_per_leaf_module: int = DEFAULT_MAX_TOKEN_PER_LEAF_MODULE,
         max_depth: int = MAX_DEPTH,
-        agent_instructions: Optional[Dict[str, Any]] = None
+        agent_instructions: Optional[Dict[str, Any]] = None,
+        api_keys: str = "",
+        concurrency: int = 0,
+        disable_proxy: bool = True,
+        cache_dir: str = ".codewiki_cache",
+        resume: bool = True,
+        model_context_window: int = 0,
+        llm_timeout: int = DEFAULT_LLM_TIMEOUT,
+        llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+        llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL,
     ) -> 'Config':
         """
         Create configuration for CLI context.
@@ -219,5 +309,14 @@ class Config:
             max_tokens=max_tokens,
             max_token_per_module=max_token_per_module,
             max_token_per_leaf_module=max_token_per_leaf_module,
-            agent_instructions=agent_instructions
+            agent_instructions=agent_instructions,
+            api_keys=api_keys,
+            concurrency=concurrency,
+            disable_proxy=disable_proxy,
+            cache_dir=cache_dir,
+            resume=resume,
+            model_context_window=model_context_window,
+            llm_timeout=llm_timeout,
+            llm_max_retries=llm_max_retries,
+            llm_retry_interval=llm_retry_interval,
         )
