@@ -22,8 +22,9 @@ from codewiki.src.be.agent_tools.generate_sub_module_documentations import (
 from codewiki.src.be.agent_tools.read_code_components import read_code_components_tool
 from codewiki.src.be.agent_tools.str_replace_editor import str_replace_editor_tool
 from codewiki.src.be.backend import LLMBackend
+from codewiki.src.be.checkpoint import CheckpointManager
 from codewiki.src.be.dependency_analyzer.models.core import Node
-from codewiki.src.be.llm_services import call_llm, create_fallback_models
+from codewiki.src.be.llm_services import call_llm, create_fallback_models, _build_model_settings
 from codewiki.src.be.prompt_template import (
     format_leaf_system_prompt,
     format_system_prompt,
@@ -39,10 +40,11 @@ logger = logging.getLogger(__name__)
 class PydanticAIBackend(LLMBackend):
     """API-key based backend using pydantic-ai + openai/litellm clients."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, ckpt: CheckpointManager | None = None) -> None:
         self._config = config
         self._fallback_models = create_fallback_models(config)
         self._custom_instructions = config.get_prompt_addition()
+        self._ckpt = ckpt
 
     def complete(
         self,
@@ -51,7 +53,18 @@ class PydanticAIBackend(LLMBackend):
         model: str | None = None,
         temperature: float = 0.0,
     ) -> str:
-        return call_llm(prompt, self._config, model=model, temperature=temperature)
+        effective_model = model or self._config.main_model
+        if self._ckpt is not None:
+            cached = self._ckpt.get_llm_cache(prompt, effective_model)
+            if cached is not None:
+                logger.info("[Resume] LLM cache hit for model=%s", effective_model)
+                return cached
+
+        response = call_llm(prompt, self._config, model=model, temperature=temperature)
+
+        if self._ckpt is not None and response:
+            self._ckpt.save_llm_cache(prompt, effective_model, response)
+        return response
 
     async def run_module_agent(
         self,
@@ -85,6 +98,7 @@ class PydanticAIBackend(LLMBackend):
                     generate_sub_module_documentation_tool,
                 ],
                 system_prompt=format_system_prompt(module_name, self._custom_instructions),
+                model_settings=_build_model_settings(self._config, self._config.main_model),
             )
         else:
             agent = Agent(
@@ -93,6 +107,7 @@ class PydanticAIBackend(LLMBackend):
                 deps_type=CodeWikiDeps,
                 tools=[read_code_components_tool, str_replace_editor_tool],
                 system_prompt=format_leaf_system_prompt(module_name, self._custom_instructions),
+                model_settings=_build_model_settings(self._config, self._config.main_model),
             )
 
         deps = CodeWikiDeps(
@@ -116,12 +131,19 @@ class PydanticAIBackend(LLMBackend):
                     core_component_ids=core_component_ids,
                     components=components,
                     module_tree=deps.module_tree,
+                    context_window=config.effective_context_window,
                 ),
                 deps=deps,
             )
             file_manager.save_json(deps.module_tree, module_tree_path)
+            if self._ckpt is not None:
+                module_key = "/".join(module_path) if module_path else module_name
+                self._ckpt.mark_done(module_key)
             return deps.module_tree
         except Exception as e:
             logger.error("Error processing module %s: %s", module_name, e)
             logger.error("Traceback: %s", traceback.format_exc())
+            if self._ckpt is not None:
+                module_key = "/".join(module_path) if module_path else module_name
+                self._ckpt.mark_failed(module_key, str(e))
             raise

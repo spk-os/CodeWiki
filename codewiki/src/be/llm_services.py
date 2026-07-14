@@ -7,17 +7,70 @@ return slightly non-standard responses (e.g. choices[].index = None).
 Supports multiple providers: openai-compatible, anthropic, bedrock, azure-openai.
 """
 import logging
+import os
+from typing import Optional
+
+import httpx
 from openai.types import chat
 
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.openai import OpenAIModelSettings
 from pydantic_ai.models.fallback import FallbackModel
-from openai import OpenAI, BadRequestError
+from openai import OpenAI, BadRequestError, RateLimitError, APIConnectionError, APIStatusError
 
-from codewiki.src.config import Config
+from codewiki.src.config import Config, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_MAX_RETRIES, DEFAULT_LLM_RETRY_INTERVAL
 
 logger = logging.getLogger(__name__)
+
+
+_PROXY_ENV_VARS = [
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+    "NO_PROXY", "no_proxy",
+]
+
+
+class ProxyDisabledContext:
+    """Context manager that temporarily clears proxy environment variables.
+
+    Some HTTP clients (httpx, openai SDK) honor ``HTTP_PROXY`` / ``HTTPS_PROXY``
+    env vars. When the user provides a direct LLM endpoint, an outer corporate
+    proxy can break the connection. This context strips those variables for
+    the duration of the call and restores them on exit.
+    """
+
+    def __init__(self) -> None:
+        self._saved: dict = {}
+
+    def _clear(self) -> None:
+        for name in _PROXY_ENV_VARS:
+            if name in os.environ:
+                self._saved[name] = os.environ.pop(name)
+
+    def _restore(self) -> None:
+        for name, value in self._saved.items():
+            os.environ[name] = value
+        self._saved.clear()
+
+    def __enter__(self) -> "ProxyDisabledContext":
+        self._clear()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._restore()
+
+    async def __aenter__(self) -> "ProxyDisabledContext":
+        self._clear()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._restore()
+
+
+def _build_proxyless_httpx_client(timeout: int = DEFAULT_LLM_TIMEOUT) -> httpx.Client:
+    """Create an httpx.Client that ignores environment proxies."""
+    return httpx.Client(trust_env=False, timeout=httpx.Timeout(float(timeout)))
 
 
 def _should_use_max_completion_tokens(model_name: str, base_url: str) -> bool:
@@ -93,75 +146,79 @@ def _create_litellm_openai_client(config: Config) -> OpenAI:
     import litellm
     # Configure litellm for the provider
     if config.provider == "bedrock":
-        import os
         os.environ.setdefault("AWS_DEFAULT_REGION", config.aws_region)
         os.environ.setdefault("AWS_REGION_NAME", config.aws_region)
 
-    # litellm exposes an OpenAI-compatible Router we can use,
-    # but the simplest path is to use litellm.completion() directly.
-    # For pydantic-ai integration, we create a proxy client.
-    return OpenAI(
-        api_key=config.llm_api_key or "not-needed-for-bedrock",
-        base_url=config.llm_base_url or "https://api.openai.com/v1",
-    )
+    with ProxyDisabledContext():
+        llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+        return OpenAI(
+            api_key=config.llm_api_key or "not-needed-for-bedrock",
+            base_url=config.llm_base_url or "https://api.openai.com/v1",
+            http_client=_build_proxyless_httpx_client(timeout=llm_timeout),
+        )
 
 
-def create_main_model(config: Config) -> CompatibleOpenAIModel:
+def create_main_model(config: Config, api_key: Optional[str] = None) -> CompatibleOpenAIModel:
     """Create the main LLM model from configuration."""
     return CompatibleOpenAIModel(
         model_name=config.main_model,
         provider=OpenAIProvider(
             base_url=config.llm_base_url,
-            api_key=config.llm_api_key
+            api_key=api_key or config.llm_api_key,
         ),
         settings=_build_model_settings(config, config.main_model)
     )
 
 
-def create_fallback_model(config: Config) -> CompatibleOpenAIModel:
+def create_fallback_model(config: Config, api_key: Optional[str] = None) -> CompatibleOpenAIModel:
     """Create the fallback LLM model from configuration."""
     return CompatibleOpenAIModel(
         model_name=config.fallback_model,
         provider=OpenAIProvider(
             base_url=config.llm_base_url,
-            api_key=config.llm_api_key
+            api_key=api_key or config.llm_api_key,
         ),
         settings=_build_model_settings(config, config.fallback_model)
     )
 
 
-def create_fallback_models(config: Config) -> FallbackModel:
+def create_fallback_models(config: Config, api_key: Optional[str] = None) -> FallbackModel:
     """Create fallback models chain from configuration."""
-    main = create_main_model(config)
-    fallback = create_fallback_model(config)
+    main = create_main_model(config, api_key=api_key)
+    fallback = create_fallback_model(config, api_key=api_key)
     return FallbackModel(main, fallback)
 
 
-def create_openai_client(config: Config) -> OpenAI:
+def create_openai_client(config: Config, api_key: Optional[str] = None, timeout: Optional[int] = None) -> OpenAI:
     """Create OpenAI client from configuration."""
-    return OpenAI(
-        base_url=config.llm_base_url,
-        api_key=config.llm_api_key
-    )
+    effective_timeout = timeout or getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+    with ProxyDisabledContext():
+        return OpenAI(
+            api_key=api_key or config.llm_api_key,
+            base_url=config.llm_base_url or "https://api.openai.com/v1",
+            http_client=_build_proxyless_httpx_client(timeout=effective_timeout),
+        )
 
 
 def call_llm(
     prompt: str,
     config: Config,
     model: str = None,
-    temperature: float = 0.0
+    temperature: float = 0.0,
+    api_key: Optional[str] = None,
 ) -> str:
-    """
-    Call LLM with the given prompt.
+    """Call LLM with timeout, retry, and logging.
 
-    Supports openai-compatible, anthropic, and bedrock providers.
-    For bedrock/anthropic, uses litellm to translate the API call.
+    Retries on transient errors (timeout, rate-limit, server errors)
+    up to ``config.llm_max_retries`` times, with ``config.llm_retry_interval``
+    seconds between attempts.  Each failure and retry is logged.
 
     Args:
         prompt: The prompt to send
         config: Configuration containing LLM settings
         model: Model name (defaults to config.main_model)
         temperature: Temperature setting
+        api_key: Override API key (for multi-key pool)
 
     Returns:
         LLM response text
@@ -169,47 +226,136 @@ def call_llm(
     if model is None:
         model = config.main_model
 
+    max_retries = getattr(config, 'llm_max_retries', DEFAULT_LLM_MAX_RETRIES)
+    retry_interval = getattr(config, 'llm_retry_interval', DEFAULT_LLM_RETRY_INTERVAL)
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return _call_llm_single(prompt, config, model, temperature, api_key=api_key)
+        except _RETRIABLE_ERRORS as e:
+            last_error = e
+            error_type = type(e).__name__
+            # Rate-limit errors: respect server's retry-after if present
+            wait_seconds = retry_interval
+            if isinstance(e, RateLimitError):
+                retry_after = _extract_retry_after(e)
+                if retry_after:
+                    wait_seconds = max(wait_seconds, retry_after)
+
+            if attempt < max_retries:
+                logger.warning(
+                    "[LLM Retry] Attempt %d/%d failed (%s: %s). "
+                    "Retrying in %ds...",
+                    attempt, max_retries, error_type,
+                    _truncate_error_msg(str(e), 200),
+                    wait_seconds,
+                )
+                _sleep(wait_seconds)
+            else:
+                logger.error(
+                    "[LLM] All %d attempts exhausted. Last error: %s: %s",
+                    max_retries, error_type, _truncate_error_msg(str(e), 500),
+                )
+        except Exception as e:
+            # Non-retriable error (auth, bad request, etc.) — fail immediately
+            logger.error(
+                "[LLM] Non-retriable error on attempt %d: %s: %s",
+                attempt, type(e).__name__, _truncate_error_msg(str(e), 500),
+            )
+            raise
+
+    # All retries exhausted
+    raise last_error
+
+
+# Error types that warrant a retry (transient / rate-limit / timeout / server)
+_RETRIABLE_ERRORS = (
+    TimeoutError,
+    ConnectionError,
+    RateLimitError,
+    APIConnectionError,
+    APIStatusError,  # covers 5xx server errors
+)
+
+
+def _extract_retry_after(err: RateLimitError) -> Optional[int]:
+    """Extract Retry-After from a RateLimitError, if the server provides it."""
+    headers = getattr(err, 'headers', None) or {}
+    val = headers.get('retry-after')
+    if val:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _truncate_error_msg(msg: str, max_len: int) -> str:
+    """Truncate error message for readable log lines."""
+    if len(msg) <= max_len:
+        return msg
+    return msg[:max_len - 3] + "..."
+
+
+def _sleep(seconds: int):
+    """Sleep for the given number of seconds."""
+    import time as _time
+    _time.sleep(seconds)
+
+
+def _call_llm_single(
+    prompt: str,
+    config: Config,
+    model: str,
+    temperature: float = 0.0,
+    api_key: Optional[str] = None,
+) -> str:
+    """Single LLM call attempt (no retry logic — called by call_llm)."""
     provider = getattr(config, "provider", "openai-compatible")
 
     if provider in ("bedrock", "anthropic"):
-        return _call_llm_via_litellm(prompt, config, model, temperature)
+        return _call_llm_via_litellm(prompt, config, model, temperature, api_key=api_key)
 
     if provider == "azure-openai":
-        return _call_llm_via_azure(prompt, config, model, temperature)
+        return _call_llm_via_azure(prompt, config, model, temperature, api_key=api_key)
 
-    # Default: OpenAI-compatible
-    client = create_openai_client(config)
+    # openai-compatible provider
+    llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
 
-    # Use the correct token parameter based on model/provider; if the server
-    # rejects our choice, swap to the other token kwarg and retry once.
-    use_completion_tokens = _should_use_max_completion_tokens(model, config.llm_base_url)
-    primary_key = "max_completion_tokens" if use_completion_tokens else "max_tokens"
-    fallback_key = "max_tokens" if use_completion_tokens else "max_completion_tokens"
+    with ProxyDisabledContext():
+        client = create_openai_client(config, api_key=api_key, timeout=llm_timeout)
 
-    base_kwargs = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-    }
+        use_completion_tokens = _should_use_max_completion_tokens(model, config.llm_base_url)
+        primary_key = "max_completion_tokens" if use_completion_tokens else "max_tokens"
+        fallback_key = "max_tokens" if use_completion_tokens else "max_completion_tokens"
 
-    try:
-        response = client.chat.completions.create(
-            **base_kwargs,
-            **{primary_key: config.max_tokens},
-        )
-    except BadRequestError as e:
-        if _is_unsupported_token_param_error(e, primary_key):
-            logger.info(
-                "Provider rejected %s for model %s; retrying with %s.",
-                primary_key, model, fallback_key,
-            )
+        base_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+        }
+
+        try:
             response = client.chat.completions.create(
                 **base_kwargs,
-                **{fallback_key: config.max_tokens},
+                **{primary_key: config.max_tokens},
+                timeout=float(llm_timeout),
             )
-        else:
-            raise
-    return response.choices[0].message.content
+        except BadRequestError as e:
+            if _is_unsupported_token_param_error(e, primary_key):
+                logger.info(
+                    "Provider rejected %s for model %s; retrying with %s.",
+                    primary_key, model, fallback_key,
+                )
+                response = client.chat.completions.create(
+                    **base_kwargs,
+                    **{fallback_key: config.max_tokens},
+                    timeout=float(llm_timeout),
+                )
+            else:
+                raise
+        return response.choices[0].message.content
 
 
 def _is_unsupported_token_param_error(err: BadRequestError, param: str) -> bool:
@@ -229,7 +375,8 @@ def _call_llm_via_litellm(
     prompt: str,
     config: Config,
     model: str,
-    temperature: float = 0.0
+    temperature: float = 0.0,
+    api_key: Optional[str] = None,
 ) -> str:
     """
     Call LLM via litellm for Bedrock/Anthropic providers.
@@ -237,24 +384,27 @@ def _call_llm_via_litellm(
     litellm handles the provider-specific API translation automatically.
     """
     import litellm
-    import os
 
     litellm_model = _get_litellm_model_name(model, config.provider)
 
-    if config.provider == "bedrock":
-        os.environ.setdefault("AWS_DEFAULT_REGION", config.aws_region)
-        os.environ.setdefault("AWS_REGION_NAME", config.aws_region)
-        logger.debug("Calling Bedrock model %s in region %s", litellm_model, config.aws_region)
-    elif config.provider == "anthropic":
-        logger.debug("Calling Anthropic model %s via litellm", litellm_model)
+    with ProxyDisabledContext():
+        if config.provider == "bedrock":
+            os.environ.setdefault("AWS_DEFAULT_REGION", config.aws_region)
+            os.environ.setdefault("AWS_REGION_NAME", config.aws_region)
+            logger.debug("Calling Bedrock model %s in region %s", litellm_model, config.aws_region)
+        elif config.provider == "anthropic":
+            logger.debug("Calling Anthropic model %s via litellm", litellm_model)
 
-    response = litellm.completion(
-        model=litellm_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=config.max_tokens,
-        api_key=config.llm_api_key if config.provider != "bedrock" else None,
-    )
+        effective_key = api_key or config.llm_api_key
+        llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+        response = litellm.completion(
+            model=litellm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=config.max_tokens,
+            api_key=effective_key if config.provider != "bedrock" else None,
+            timeout=float(llm_timeout),
+        )
     return response.choices[0].message.content
 
 
@@ -262,7 +412,8 @@ def _call_llm_via_azure(
     prompt: str,
     config: Config,
     model: str,
-    temperature: float = 0.0
+    temperature: float = 0.0,
+    api_key: Optional[str] = None,
 ) -> str:
     """
     Call LLM via Azure OpenAI.
@@ -272,19 +423,24 @@ def _call_llm_via_azure(
     """
     from openai import AzureOpenAI
 
-    client = AzureOpenAI(
-        api_key=config.llm_api_key,
-        api_version=config.api_version,
-        azure_endpoint=config.llm_base_url,
-    )
+    with ProxyDisabledContext():
+        llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+        client = AzureOpenAI(
+            api_key=api_key or config.llm_api_key,
+            api_version=config.api_version,
+            azure_endpoint=config.llm_base_url,
+            http_client=_build_proxyless_httpx_client(timeout=llm_timeout),
+        )
 
-    deployment = config.azure_deployment or model
-    logger.debug("Calling Azure OpenAI deployment %s (api_version=%s)", deployment, config.api_version)
+        deployment = config.azure_deployment or model
+        logger.debug("Calling Azure OpenAI deployment %s (api_version=%s)", deployment, config.api_version)
 
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=config.max_tokens,
-    )
+        llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=config.max_tokens,
+            timeout=float(llm_timeout),
+        )
     return response.choices[0].message.content
