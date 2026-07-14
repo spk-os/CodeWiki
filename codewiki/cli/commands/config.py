@@ -111,6 +111,54 @@ def config_group():
     type=str,
     help="Azure OpenAI deployment name"
 )
+@click.option(
+    "--api-keys",
+    type=str,
+    default=None,
+    help="Multiple LLM API keys, comma-separated (e.g., 'sk-key1,sk-key2,sk-key3')"
+)
+@click.option(
+    "--concurrency",
+    type=int,
+    default=None,
+    help="Maximum concurrent LLM calls (0=auto, equals key count)"
+)
+@click.option(
+    "--disable-proxy/--no-disable-proxy",
+    "disable_proxy",
+    default=None,
+    help="Disable proxy for LLM API calls (default: enabled)"
+)
+@click.option(
+    "--cache-dir",
+    type=str,
+    default=None,
+    help="Checkpoint and cache directory (default: .codewiki_cache)"
+)
+@click.option(
+    "--model-context-window",
+    type=int,
+    default=None,
+    help="Model context window limit in tokens (0=auto-detect from model name)"
+)
+@click.option(
+    "--llm-timeout",
+    type=int,
+    default=None,
+    help="LLM call timeout in seconds (default: 1200 = 20 minutes)"
+)
+@click.option(
+    "--llm-max-retries",
+    type=int,
+    default=None,
+    help="Max retry attempts for transient LLM errors (default: 10)"
+)
+@click.option(
+    "--llm-retry-interval",
+    type=int,
+    default=None,
+    help="Seconds between LLM retry attempts (default: 60)"
+)
 def config_set(
     api_key: Optional[str],
     base_url: Optional[str],
@@ -124,7 +172,15 @@ def config_set(
     provider: Optional[str] = None,
     aws_region: Optional[str] = None,
     api_version: Optional[str] = None,
-    azure_deployment: Optional[str] = None
+    azure_deployment: Optional[str] = None,
+    api_keys: Optional[str] = None,
+    concurrency: Optional[int] = None,
+    disable_proxy: Optional[bool] = None,
+    cache_dir: Optional[str] = None,
+    model_context_window: Optional[int] = None,
+    llm_timeout: Optional[int] = None,
+    llm_max_retries: Optional[int] = None,
+    llm_retry_interval: Optional[int] = None,
 ):
     """
     Set configuration values for CodeWiki.
@@ -173,7 +229,7 @@ def config_set(
     """
     try:
         # Check if at least one option is provided
-        if not any([api_key, base_url, main_model, cluster_model, fallback_model, max_tokens, max_token_per_module, max_token_per_leaf_module, max_depth, provider, aws_region, api_version, azure_deployment]):
+        if not any([api_key, base_url, main_model, cluster_model, fallback_model, max_tokens, max_token_per_module, max_token_per_leaf_module, max_depth, provider, aws_region, api_version, azure_deployment, api_keys, concurrency is not None, disable_proxy is not None, cache_dir, model_context_window is not None, llm_timeout is not None, llm_max_retries is not None, llm_retry_interval is not None]):
             click.echo("No options provided. Use --help for usage information.")
             sys.exit(EXIT_CONFIG_ERROR)
 
@@ -237,6 +293,43 @@ def config_set(
         if azure_deployment is not None:
             validated_data['azure_deployment'] = azure_deployment
 
+        if api_keys:
+            keys_list = [k.strip() for k in api_keys.split(',') if k.strip()]
+            if not keys_list:
+                raise ConfigurationError("--api-keys must contain at least one non-empty key")
+            for k in keys_list:
+                validate_api_key(k)
+            validated_data['api_keys'] = ','.join(keys_list)
+
+        if concurrency is not None:
+            if concurrency < 0:
+                raise ConfigurationError("concurrency must be >= 0")
+            validated_data['concurrency'] = concurrency
+
+        if disable_proxy is not None:
+            validated_data['disable_proxy'] = disable_proxy
+
+        if cache_dir is not None:
+            validated_data['cache_dir'] = cache_dir
+
+        if model_context_window is not None:
+            validated_data['model_context_window'] = model_context_window
+
+        if llm_timeout is not None:
+            if llm_timeout < 1:
+                raise ConfigurationError("llm_timeout must be a positive integer (seconds)")
+            validated_data['llm_timeout'] = llm_timeout
+
+        if llm_max_retries is not None:
+            if llm_max_retries < 0:
+                raise ConfigurationError("llm_max_retries must be >= 0")
+            validated_data['llm_max_retries'] = llm_max_retries
+
+        if llm_retry_interval is not None:
+            if llm_retry_interval < 1:
+                raise ConfigurationError("llm_retry_interval must be a positive integer (seconds)")
+            validated_data['llm_retry_interval'] = llm_retry_interval
+
         # Create config manager and save
         manager = ConfigManager()
         manager.load()  # Load existing config if present
@@ -254,7 +347,15 @@ def config_set(
             provider=validated_data.get('provider'),
             aws_region=validated_data.get('aws_region'),
             api_version=validated_data.get('api_version'),
-            azure_deployment=validated_data.get('azure_deployment')
+            azure_deployment=validated_data.get('azure_deployment'),
+            api_keys=validated_data.get('api_keys'),
+            concurrency=validated_data.get('concurrency'),
+            disable_proxy=validated_data.get('disable_proxy'),
+            cache_dir=validated_data.get('cache_dir'),
+            model_context_window=validated_data.get('model_context_window'),
+            llm_timeout=validated_data.get('llm_timeout'),
+            llm_max_retries=validated_data.get('llm_max_retries'),
+            llm_retry_interval=validated_data.get('llm_retry_interval'),
         )
         
         # Display success messages
@@ -314,6 +415,39 @@ def config_set(
 
         if azure_deployment:
             click.secho(f"✓ Azure Deployment: {azure_deployment}", fg="green")
+
+        if api_keys:
+            keys_count = len(validated_data.get('api_keys', '').split(',')) if validated_data.get('api_keys') else 0
+            click.secho(f"✓ API keys configured: {keys_count} key(s)", fg="green")
+
+        if concurrency is not None:
+            display = "auto (= key count)" if concurrency == 0 else str(concurrency)
+            click.secho(f"✓ Concurrency: {display}", fg="green")
+
+        if disable_proxy is not None:
+            click.secho(f"✓ Disable proxy: {disable_proxy}", fg="green")
+
+        if cache_dir is not None:
+            click.secho(f"✓ Cache dir: {cache_dir}", fg="green")
+
+        if model_context_window is not None:
+            display = "auto-detect" if model_context_window == 0 else str(model_context_window)
+            click.secho(f"✓ Model context window: {display} tokens", fg="green")
+
+        if llm_timeout is not None:
+            minutes = llm_timeout // 60
+            secs = llm_timeout % 60
+            display = f"{minutes}m {secs}s" if secs else f"{minutes}m"
+            click.secho(f"✓ LLM timeout: {display} ({llm_timeout}s)", fg="green")
+
+        if llm_max_retries is not None:
+            click.secho(f"✓ LLM max retries: {llm_max_retries}", fg="green")
+
+        if llm_retry_interval is not None:
+            minutes = llm_retry_interval // 60
+            secs = llm_retry_interval % 60
+            display = f"{minutes}m {secs}s" if secs else f"{minutes}m"
+            click.secho(f"✓ LLM retry interval: {display} ({llm_retry_interval}s)", fg="green")
 
         click.echo("\n" + click.style("Configuration updated successfully.", fg="green", bold=True))
         
@@ -376,6 +510,16 @@ def config_show(output_json: bool):
                 "max_token_per_leaf_module": config.max_token_per_leaf_module if config else 16000,
                 "max_depth": config.max_depth if config else 2,
                 "agent_instructions": config.agent_instructions.to_dict() if config and config.agent_instructions else {},
+                "api_keys_count": len(config.effective_keys) if config else 0,
+                "concurrency": config.concurrency if config else 0,
+                "effective_concurrency": config.effective_concurrency if config else 1,
+                "disable_proxy": config.disable_proxy if config else True,
+                "cache_dir": config.cache_dir if config else ".codewiki_cache",
+                "resume": config.resume if config else True,
+                "model_context_window": config.model_context_window if config else 0,
+                "llm_timeout": config.llm_timeout if config else 1200,
+                "llm_max_retries": config.llm_max_retries if config else 10,
+                "llm_retry_interval": config.llm_retry_interval if config else 60,
                 "config_file": str(manager.config_file_path)
             }
             click.echo(json.dumps(output, indent=2))
@@ -435,6 +579,31 @@ def config_show(output_json: bool):
             click.secho("Decomposition Settings", fg="cyan", bold=True)
             if config:
                 click.echo(f"  Max Depth:               {config.max_depth}")
+
+            click.echo()
+            click.secho("Concurrency & Checkpoint", fg="cyan", bold=True)
+            if config:
+                key_count = len(config.effective_keys)
+                if key_count > 0:
+                    click.echo(f"  API Keys (multi):        {key_count} key(s)")
+                else:
+                    click.echo(f"  API Keys (multi):        (single key from credentials)")
+                concurrency_display = "auto" if config.concurrency == 0 else str(config.concurrency)
+                click.echo(f"  Concurrency:             {concurrency_display} (effective: {config.effective_concurrency})")
+                click.echo(f"  Disable Proxy:           {config.disable_proxy}")
+                click.echo(f"  Cache Dir:               {config.cache_dir}")
+                click.echo(f"  Resume:                  {config.resume}")
+                ctx_display = "auto-detect" if config.model_context_window == 0 else str(config.model_context_window)
+                click.echo(f"  Model Context Window:    {ctx_display} tokens")
+                timeout_m = config.llm_timeout // 60
+                timeout_s = config.llm_timeout % 60
+                timeout_display = f"{timeout_m}m {timeout_s}s" if timeout_s else f"{timeout_m}m"
+                click.echo(f"  LLM Timeout:             {timeout_display} ({config.llm_timeout}s)")
+                click.echo(f"  LLM Max Retries:         {config.llm_max_retries}")
+                retry_m = config.llm_retry_interval // 60
+                retry_s = config.llm_retry_interval % 60
+                retry_display = f"{retry_m}m {retry_s}s" if retry_s else f"{retry_m}m"
+                click.echo(f"  LLM Retry Interval:      {retry_display} ({config.llm_retry_interval}s)")
             
             click.echo()
             click.secho("Agent Instructions", fg="cyan", bold=True)

@@ -135,7 +135,16 @@ class ConfigManager:
         provider: Optional[str] = None,
         aws_region: Optional[str] = None,
         api_version: Optional[str] = None,
-        azure_deployment: Optional[str] = None
+        azure_deployment: Optional[str] = None,
+        api_keys: Optional[str] = None,
+        concurrency: Optional[int] = None,
+        disable_proxy: Optional[bool] = None,
+        cache_dir: Optional[str] = None,
+        resume: Optional[bool] = None,
+        model_context_window: Optional[int] = None,
+        llm_timeout: Optional[int] = None,
+        llm_max_retries: Optional[int] = None,
+        llm_retry_interval: Optional[int] = None,
     ):
         """
         Save configuration to file and keyring.
@@ -204,6 +213,24 @@ class ConfigManager:
             self._config.api_version = api_version
         if azure_deployment is not None:
             self._config.azure_deployment = azure_deployment
+        if api_keys is not None:
+            self._config.api_keys = api_keys
+        if concurrency is not None:
+            self._config.concurrency = concurrency
+        if disable_proxy is not None:
+            self._config.disable_proxy = disable_proxy
+        if cache_dir is not None:
+            self._config.cache_dir = cache_dir
+        if resume is not None:
+            self._config.resume = resume
+        if model_context_window is not None:
+            self._config.model_context_window = model_context_window
+        if llm_timeout is not None:
+            self._config.llm_timeout = llm_timeout
+        if llm_max_retries is not None:
+            self._config.llm_max_retries = llm_max_retries
+        if llm_retry_interval is not None:
+            self._config.llm_retry_interval = llm_retry_interval
 
         # Validate configuration whenever the minimum required fields are set.
         # Caw providers only need main_model; API providers need base_url +
@@ -216,23 +243,27 @@ class ConfigManager:
         elif self._config.base_url and self._config.main_model and self._config.cluster_model:
             self._config.validate()
         
-        # Save API key to keyring, falling back to file
-        if api_key is not None:
-            self._api_key = api_key
+        # Save API key to keyring, falling back to file.
+        # If api_keys (multi-key) is provided, store the entire comma-separated
+        # string in the keyring slot — get_api_key() returns it verbatim and
+        # backend code parses with effective_keys.  Multi-key takes priority
+        # over a single api_key when both are passed in the same call.
+        secret_to_store = api_keys if api_keys else api_key
+        if secret_to_store is not None:
+            self._api_key = secret_to_store
             if self._keyring_available:
                 try:
-                    keyring.set_password(KEYRING_SERVICE, KEYRING_API_KEY_ACCOUNT, api_key)
+                    keyring.set_password(KEYRING_SERVICE, KEYRING_API_KEY_ACCOUNT, secret_to_store)
                 except (KeyringError, Exception):
-                    # Keyring failed at runtime — fall back to file
                     self._keyring_available = False
-                    self._save_api_key_to_file(api_key)
+                    self._save_api_key_to_file(secret_to_store)
                     logger.warning(
                         "System keychain unavailable. API key stored in %s "
                         "(plaintext). Set CODEWIKI_NO_KEYRING=1 to suppress this warning.",
                         CREDENTIALS_FILE
                     )
             else:
-                self._save_api_key_to_file(api_key)
+                self._save_api_key_to_file(secret_to_store)
         
         # Save non-sensitive config to JSON
         config_data = {

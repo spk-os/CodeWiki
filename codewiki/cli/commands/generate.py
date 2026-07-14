@@ -307,6 +307,30 @@ def _invalidate_affected_modules(
     default=None,
     help="Commit hash to compare against for incremental updates (overrides stored commit in metadata.json)",
 )
+@click.option(
+    "--resume/--no-resume",
+    default=True,
+    show_default=True,
+    help="Resume from last checkpoint if available (default: enabled)",
+)
+@click.option(
+    "--clear-cache",
+    is_flag=True,
+    default=False,
+    help="Clear existing checkpoint cache and start from scratch",
+)
+@click.option(
+    "--cache-dir",
+    type=str,
+    default=None,
+    help="Checkpoint cache directory (default: .codewiki_cache)",
+)
+@click.option(
+    "--concurrency",
+    type=int,
+    default=None,
+    help="Override max concurrent LLM calls",
+)
 @click.pass_context
 def generate_command(
     ctx,
@@ -325,7 +349,11 @@ def generate_command(
     max_token_per_leaf_module: Optional[int],
     max_depth: Optional[int],
     update: bool = False,
-    compare_to: Optional[str] = None
+    compare_to: Optional[str] = None,
+    resume: bool = True,
+    clear_cache: bool = False,
+    cache_dir: Optional[str] = None,
+    concurrency: Optional[int] = None,
 ):
     """
     Generate comprehensive documentation for a code repository.
@@ -398,7 +426,11 @@ def generate_command(
             )
         
         config = config_manager.get_config()
-        api_key = config_manager.get_api_key()
+        raw_api_key = config_manager.get_api_key() or ''
+        # When multi-key is configured, the OpenAI client needs a single key
+        # (not the comma-separated string).  Use the first key for client auth;
+        # the ApiKeyPool handles round-robin distribution during concurrent calls.
+        effective_api_key = raw_api_key.split(',')[0].strip() if raw_api_key else ''
         
         logger.success("Configuration valid")
         
@@ -428,6 +460,32 @@ def generate_command(
         check_writable_output(output_dir.parent)
         
         logger.success(f"Output directory: {output_dir}")
+
+        # Initialize checkpoint manager (best-effort: backend module may not yet
+        # be available in older installs — degrade gracefully).
+        effective_cache_dir = cache_dir or config.cache_dir
+        try:
+            from codewiki.src.be.checkpoint import CheckpointManager
+            ckpt = CheckpointManager(repo_path=str(repo_path), cache_root=effective_cache_dir)
+            if clear_cache:
+                import shutil
+                shutil.rmtree(ckpt.cache_dir, ignore_errors=True)
+                logger.info("[Cache] Cleared existing checkpoint cache.")
+            ckpt.load_or_create()
+            prog = ckpt.progress()
+            if prog.get("done", 0) > 0 and resume:
+                logger.info(
+                    f"[Resume] Detected previous progress: {prog['done']}/{prog['total']} "
+                    f"completed ({prog.get('pct', 0)}%)"
+                )
+            elif verbose:
+                logger.debug(f"[Checkpoint] Initialized at {ckpt.cache_dir}")
+        except ImportError:
+            if verbose:
+                logger.debug("Checkpoint backend not available; continuing without resume support.")
+        except Exception as e:
+            if verbose:
+                logger.debug(f"Checkpoint initialization failed: {e}")
         
         # If a base commit is specified to compare against, implicitly enable update
         if compare_to:
@@ -552,7 +610,7 @@ def generate_command(
                 'cluster_model': config.cluster_model,
                 'fallback_model': config.fallback_model,
                 'base_url': config.base_url,
-                'api_key': api_key,
+                'api_key': effective_api_key,
                 'provider': getattr(config, 'provider', 'openai-compatible'),
                 'aws_region': getattr(config, 'aws_region', 'us-east-1'),
                 'agent_instructions': agent_instructions_dict,
@@ -562,6 +620,16 @@ def generate_command(
                 'max_token_per_leaf_module': max_token_per_leaf_module if max_token_per_leaf_module is not None else config.max_token_per_leaf_module,
                 # Max depth setting (runtime override takes precedence)
                 'max_depth': max_depth if max_depth is not None else config.max_depth,
+                # Multi-key / checkpoint settings
+                'resume': resume,
+                'cache_dir': effective_cache_dir,
+                'disable_proxy': config.disable_proxy,
+                'api_keys': config.api_keys,
+                'concurrency': concurrency if concurrency is not None else config.effective_concurrency,
+                'model_context_window': config.model_context_window,
+                'llm_timeout': config.llm_timeout,
+                'llm_max_retries': config.llm_max_retries,
+                'llm_retry_interval': config.llm_retry_interval,
             },
             verbose=verbose,
             generate_html=github_pages,
@@ -629,4 +697,112 @@ def generate_command(
         sys.exit(130)
     except Exception as e:
         sys.exit(handle_error(e, verbose=verbose))
+
+
+@click.command(name="status")
+@click.option(
+    "--cache-dir",
+    type=str,
+    default=None,
+    help="Checkpoint cache directory (default: from config or .codewiki_cache)",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help="Output in JSON format",
+)
+def status_command(cache_dir: Optional[str], output_json: bool):
+    """
+    Display checkpoint progress for the current repository.
+
+    Shows total / done / failed / pending counts and details on failed
+    tasks so you can decide whether to resume or clear the cache.
+    """
+    import json as _json
+
+    try:
+        try:
+            from codewiki.src.be.checkpoint import CheckpointManager
+        except ImportError:
+            click.secho(
+                "✗ Checkpoint backend not available in this install.",
+                fg="red", err=True,
+            )
+            sys.exit(1)
+
+        config_manager = ConfigManager()
+        config_manager.load()
+        config = config_manager.get_config()
+        effective_cache_dir = cache_dir or (config.cache_dir if config else ".codewiki_cache")
+
+        repo_path = Path.cwd()
+        ckpt = CheckpointManager(repo_path=str(repo_path), cache_root=effective_cache_dir)
+        state = ckpt.load_or_create()
+        prog = ckpt.progress()
+
+        repo_hash = getattr(ckpt, "repo_hash", None) or (
+            state.get("repo_hash") if isinstance(state, dict) else None
+        )
+        last_update = None
+        if isinstance(state, dict):
+            last_update = state.get("last_update") or state.get("updated_at")
+
+        failed_tasks = []
+        if isinstance(state, dict):
+            tasks = state.get("tasks") or {}
+            if isinstance(tasks, dict):
+                for task_id, info in tasks.items():
+                    if not isinstance(info, dict):
+                        continue
+                    if info.get("status") == "failed":
+                        failed_tasks.append({
+                            "task_id": task_id,
+                            "stage": info.get("stage", "unknown"),
+                            "error": info.get("error", ""),
+                        })
+
+        if output_json:
+            click.echo(_json.dumps({
+                "repo_path": str(repo_path),
+                "repo_hash": repo_hash,
+                "cache_dir": str(ckpt.cache_dir),
+                "last_update": last_update,
+                "progress": prog,
+                "failed": failed_tasks,
+            }, indent=2, default=str))
+            return
+
+        click.echo()
+        click.secho("CodeWiki Checkpoint Status", fg="blue", bold=True)
+        click.echo("━" * 40)
+        click.echo()
+        click.echo(f"Repo path:    {repo_path}")
+        if repo_hash:
+            click.echo(f"Repo hash:    {repo_hash}")
+        click.echo(f"Cache dir:    {ckpt.cache_dir}")
+        if last_update:
+            click.echo(f"Last update:  {last_update}")
+        click.echo()
+
+        click.secho("Progress", fg="cyan", bold=True)
+        click.echo(f"  Total:    {prog.get('total', 0)}")
+        click.echo(f"  Done:     {prog.get('done', 0)}")
+        click.echo(f"  Failed:   {prog.get('failed', 0)}")
+        click.echo(f"  Pending:  {prog.get('pending', 0)}")
+        click.echo(f"  Percent:  {prog.get('pct', 0)}%")
+
+        if failed_tasks:
+            click.echo()
+            click.secho(f"Failed tasks ({len(failed_tasks)})", fg="red", bold=True)
+            for t in failed_tasks[:20]:
+                click.echo(f"  [{t['stage']}] {t['task_id']}")
+                if t['error']:
+                    click.echo(f"      └─ {t['error']}")
+            if len(failed_tasks) > 20:
+                click.echo(f"  ... and {len(failed_tasks) - 20} more")
+
+        click.echo()
+    except Exception as e:
+        sys.exit(handle_error(e))
 

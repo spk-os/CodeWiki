@@ -137,6 +137,40 @@ class Configuration:
     max_token_per_leaf_module: int = 16000
     max_depth: int = 2
     agent_instructions: AgentInstructions = field(default_factory=AgentInstructions)
+    # Multi-key concurrency / checkpoint settings
+    api_keys: str = ""  # comma-separated multi API keys, priority over single api_key
+    concurrency: int = 0  # max concurrency (0 = auto = key count)
+    disable_proxy: bool = True  # disable proxy for LLM calls
+    cache_dir: str = ".codewiki_cache"  # checkpoint/cache directory
+    resume: bool = True  # enable checkpoint resume
+    model_context_window: int = 0  # model context window limit in tokens (0 = auto-detect)
+    # LLM call resilience
+    llm_timeout: int = 1200  # LLM call timeout in seconds (default: 20 minutes)
+    llm_max_retries: int = 10  # max retry attempts for transient errors
+    llm_retry_interval: int = 60  # seconds between retries (default: 1 minute)
+
+    @property
+    def effective_keys(self) -> List[str]:
+        """Return list of API keys parsed from api_keys (comma-separated).
+
+        Falls back to an empty list if neither ``api_keys`` nor a single key is
+        set.  The single-key case is handled by callers that pass the keyring
+        api_key explicitly.
+        """
+        if self.api_keys:
+            return [k.strip() for k in self.api_keys.split(',') if k.strip()]
+        return []
+
+    @property
+    def effective_concurrency(self) -> int:
+        """Return concurrency (>0) or fallback to number of effective keys.
+
+        If no keys and no explicit concurrency set, returns 1.
+        """
+        if self.concurrency and self.concurrency > 0:
+            return self.concurrency
+        keys = self.effective_keys
+        return len(keys) if keys else 1
     
     def validate(self):
         """
@@ -173,6 +207,15 @@ class Configuration:
             'max_token_per_leaf_module': self.max_token_per_leaf_module,
             'max_depth': self.max_depth,
             'fallback_model': self.fallback_model,
+            'api_keys': self.api_keys,
+            'concurrency': self.concurrency,
+            'disable_proxy': self.disable_proxy,
+            'cache_dir': self.cache_dir,
+            'resume': self.resume,
+            'model_context_window': self.model_context_window,
+            'llm_timeout': self.llm_timeout,
+            'llm_max_retries': self.llm_max_retries,
+            'llm_retry_interval': self.llm_retry_interval,
         }
         if self.agent_instructions and not self.agent_instructions.is_empty():
             result['agent_instructions'] = self.agent_instructions.to_dict()
@@ -208,6 +251,15 @@ class Configuration:
             max_token_per_leaf_module=data.get('max_token_per_leaf_module', 16000),
             max_depth=data.get('max_depth', 2),
             agent_instructions=agent_instructions,
+            api_keys=data.get('api_keys', ''),
+            concurrency=data.get('concurrency', 0),
+            disable_proxy=data.get('disable_proxy', True),
+            cache_dir=data.get('cache_dir', '.codewiki_cache'),
+            resume=data.get('resume', True),
+            model_context_window=data.get('model_context_window', 0),
+            llm_timeout=data.get('llm_timeout', 1200),
+            llm_max_retries=data.get('llm_max_retries', 10),
+            llm_retry_interval=data.get('llm_retry_interval', 60),
         )
     
     def is_complete(self) -> bool:
@@ -244,7 +296,8 @@ class Configuration:
             Backend Config instance ready for documentation generation
         """
         from codewiki.src.config import Config
-        
+        import inspect
+
         # Merge runtime instructions with persistent settings
         # Runtime instructions take precedence
         final_instructions = self.agent_instructions
@@ -256,8 +309,8 @@ class Configuration:
                 doc_type=runtime_instructions.doc_type or self.agent_instructions.doc_type,
                 custom_instructions=runtime_instructions.custom_instructions or self.agent_instructions.custom_instructions,
             )
-        
-        return Config.from_cli(
+
+        kwargs = dict(
             repo_path=repo_path,
             output_dir=output_dir,
             llm_base_url=self.base_url,
@@ -273,6 +326,26 @@ class Configuration:
             max_token_per_module=self.max_token_per_module,
             max_token_per_leaf_module=self.max_token_per_leaf_module,
             max_depth=self.max_depth,
-            agent_instructions=final_instructions.to_dict() if final_instructions else None
+            agent_instructions=final_instructions.to_dict() if final_instructions else None,
         )
+
+        # Forward new multi-key / checkpoint params only if backend supports them.
+        # This keeps the CLI compatible with older backend versions during the
+        # parallel rollout of checkpoint.py / key_pool.py.
+        backend_params = inspect.signature(Config.from_cli).parameters
+        for name, value in (
+            ('api_keys', self.api_keys),
+            ('concurrency', self.concurrency),
+            ('disable_proxy', self.disable_proxy),
+            ('cache_dir', self.cache_dir),
+            ('resume', self.resume),
+            ('model_context_window', self.model_context_window),
+            ('llm_timeout', self.llm_timeout),
+            ('llm_max_retries', self.llm_max_retries),
+            ('llm_retry_interval', self.llm_retry_interval),
+        ):
+            if name in backend_params:
+                kwargs[name] = value
+
+        return Config.from_cli(**kwargs)
 
