@@ -25,11 +25,17 @@ Usage:
 """
 
 import logging
+import os
 import sys
 from colorama import Fore, Style, init
 
 # Initialize colorama for cross-platform colored terminal output
 init(autoreset=True)
+
+
+LOG_DIR = "/usr/log/codewiki"
+LOG_FILE_NAME = "codewiki.log"
+FILE_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(filename)s:%(funcName)s:%(lineno)d - %(message)s"
 
 
 class ColoredFormatter(logging.Formatter):
@@ -69,13 +75,14 @@ class ColoredFormatter(logging.Formatter):
         
         # Format log level with color
         colored_level = f"{level_color}{record.levelname:8}{self.COMPONENT_COLORS['reset']}"
-        
+
+        location = f"{self.COMPONENT_COLORS['module']}{record.filename}:{record.funcName}:{record.lineno}{self.COMPONENT_COLORS['reset']}"
+
         # Format the message with the same color as the log level
         message = record.getMessage()
         colored_message = f"{level_color}{message}{self.COMPONENT_COLORS['reset']}"
-        
-        # Combine all parts (without module name column)
-        log_line = f"{colored_timestamp} {colored_level} {colored_message}"
+
+        log_line = f"{colored_timestamp} {colored_level} {location} {colored_message}"
         
         # Handle exceptions
         if record.exc_info:
@@ -108,6 +115,26 @@ def setup_logging(level=logging.INFO):
     
     # Add our console handler
     root_logger.addHandler(console_handler)
+
+    file_handler = _build_file_handler()
+    if file_handler is not None:
+        root_logger.addHandler(file_handler)
+
+
+def _build_file_handler():
+    """Create a file handler under LOG_DIR. Returns None if filesystem unavailable."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, LOG_FILE_NAME)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(FILE_LOG_FORMAT))
+        return file_handler
+    except (OSError, PermissionError) as e:
+        sys.stderr.write(
+            f"[logging_config] Could not create file handler at {LOG_DIR}: {e}\n"
+        )
+        return None
 
 
 def setup_module_logging(module_name: str, level=logging.INFO):
