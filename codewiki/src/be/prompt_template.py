@@ -202,6 +202,41 @@ Firstly reason based on given context and then group them and return the result 
 </GROUPED_COMPONENTS>
 """.strip()
 
+CLUSTER_FILES_PROMPT = """
+Here is a list of all files in the {scope} containing code components:
+<FILES>
+{files}
+</FILES>
+
+Please group the files into modules such that each group is a set of files that are closely related to each other and together they form a module. DO NOT include files that are not essential to the {scope}.
+
+Return the file paths EXACTLY as given — do NOT modify, shorten, or strip any part of the path.
+
+Firstly reason about the files and then group them and return the result in the following format:
+<GROUPED_COMPONENTS>
+{{
+    "module_name_1": {{
+        "path": <path_to_the_module_1>,
+        "components": [
+            <file_path_1>,
+            <file_path_2>,
+            ...
+        ]
+    }},
+    "module_name_2": {{
+        "path": <path_to_the_module_2>,
+        "components": [
+            <file_path_1>,
+            <file_path_2>,
+            ...
+        ]
+    }},
+    ...
+}}
+</GROUPED_COMPONENTS>
+""".strip()
+
+
 FILTER_FOLDERS_PROMPT = """
 Here is the list of relative paths of files, folders in 2-depth of project {project_name}:
 ```
@@ -216,6 +251,7 @@ Reasoning at first, then return the list of relative paths in JSON format.
 """
 
 from typing import Dict, Any
+from collections import defaultdict
 from codewiki.src.utils import file_manager
 
 EXTENSION_TO_LANGUAGE = {
@@ -248,18 +284,25 @@ EXTENSION_TO_LANGUAGE = {
 }
 
 
-def format_user_prompt(module_name: str, core_component_ids: list[str], components: Dict[str, Any], module_tree: dict[str, any]) -> str:
-    """
-    Format the user prompt with module name and organized core component codes.
-    
+def format_user_prompt(
+    module_name: str,
+    core_component_ids: list[str],
+    components: Dict[str, Any],
+    module_tree: dict[str, any],
+    context_window: int = 0,
+) -> str:
+    """Format the user prompt with module name and organized core component codes.
+
     Args:
         module_name: Name of the module to document
         core_component_ids: List of component IDs to include
         components: Dictionary mapping component IDs to CodeComponent objects
-    
-    Returns:
-        Formatted user prompt string
+        module_tree: Module tree structure for context
+        context_window: Maximum model context window in tokens (0 = unlimited).
+            When set, file content is truncated to stay within the limit.
     """
+
+    from codewiki.src.be.utils import count_tokens
 
     # format module tree
     lines = []
@@ -271,8 +314,6 @@ def format_user_prompt(module_name: str, core_component_ids: list[str], componen
             else:
                 lines.append(f"{'  ' * indent}{key}")
 
-            # Group components by file
-            from collections import defaultdict
             by_file = defaultdict(list)
             for c in value['components']:
                 if "::" in c:
@@ -293,8 +334,6 @@ def format_user_prompt(module_name: str, core_component_ids: list[str], componen
     _format_module_tree(module_tree, 0)
     formatted_module_tree = "\n".join(lines)
 
-    # print(f"Formatted module tree:\n{formatted_module_tree}")
-
     # Group core component IDs by their file path
     grouped_components: dict[str, list[str]] = {}
     for component_id in core_component_ids:
@@ -306,24 +345,50 @@ def format_user_prompt(module_name: str, core_component_ids: list[str], componen
             grouped_components[path] = []
         grouped_components[path].append(component_id)
 
+    # Build the core component codes section with context-window-aware truncation.
+    # Reserve 60% of the context window for file content, 20% for the module tree
+    # and system prompt, 20% for the model's response.
+    max_content_tokens = int(context_window * 0.6) if context_window > 0 else 0
+    current_content_tokens = 0
+    truncated_files = []
+
     core_component_codes = ""
     for path, component_ids_in_file in grouped_components.items():
-        core_component_codes += f"# File: {path}\n\n"
-        core_component_codes += f"## Core Components in this file:\n"
-        
-        for component_id in component_ids_in_file:
-            core_component_codes += f"- {component_id}\n"
-        
-        core_component_codes += f"\n## File Content:\n```{EXTENSION_TO_LANGUAGE['.'+path.split('.')[-1]]}\n"
-        
-        # Read content of the file using the first component's file path
+        component_ids_str = "\n".join(f"- {cid}" for cid in component_ids_in_file)
+
+        core_component_codes += f"# File: {path}\n"
+        core_component_codes += f"## Core Components in this file:\n{component_ids_str}\n"
+        core_component_codes += f"\n## File Content:\ ```{EXTENSION_TO_LANGUAGE['.'+path.split('.')[-1]]}\n"
+
         try:
-            core_component_codes += file_manager.load_text(components[component_ids_in_file[0]].file_path)
+            file_content = file_manager.load_text(components[component_ids_in_file[0]].file_path)
         except (FileNotFoundError, IOError) as e:
-            core_component_codes += f"# Error reading file: {e}\n"
-        
-        core_component_codes += "```\n\n"
-        
+            file_content = f"# Error reading file: {e}\n"
+
+        if max_content_tokens > 0:
+            content_tokens = count_tokens(file_content)
+            if current_content_tokens + content_tokens > max_content_tokens:
+                remaining = max_content_tokens - current_content_tokens
+                if remaining > 500:
+                    # Truncate file content to fit remaining budget
+                    char_budget = remaining * 4  # ~4 chars per token
+                    file_content = file_content[:char_budget] + "\n# ... (truncated to fit context window)\n"
+                    truncated_files.append(path)
+                    current_content_tokens = max_content_tokens
+                else:
+                    # No room left — only include file name + component list
+                    file_content = "# File content omitted to fit within context window\n"
+                    truncated_files.append(path)
+            else:
+                current_content_tokens += content_tokens
+
+        core_component_codes += file_content
+        core_component_codes += "\``\n\n"
+
+    if truncated_files:
+        core_component_codes += f"# Note: {len(truncated_files)} files were truncated to fit within the {context_window}-token context window.\n"
+        core_component_codes += "# You can explore the full content using the `read_code_components` tool.\n"
+
     return USER_PROMPT.format(module_name=module_name, formatted_core_component_codes=core_component_codes, module_tree=formatted_module_tree)
 
 
@@ -408,3 +473,24 @@ def format_leaf_system_prompt(module_name: str, custom_instructions: str = None)
         custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{custom_instructions}\n</CUSTOM_INSTRUCTIONS>"
     
     return LEAF_SYSTEM_PROMPT.format(module_name=module_name, custom_instructions=custom_section).strip()
+
+
+def format_file_cluster_prompt(file_paths: list[str], module_name: str = None) -> str:
+    """Format the file-level cluster prompt for two-pass clustering.
+
+    Used when the component-level prompt would exceed the LLM's context
+    window or output token limit.  Instead of sending individual component
+    IDs, we send only file paths and ask the LLM to group files into
+    top-level modules.  Each module's components are then clustered in a
+    follow-up recursive call.
+
+    Args:
+        file_paths: List of file paths to cluster
+        module_name: Name of the current module (None for repository root)
+
+    Returns:
+        Formatted prompt string
+    """
+    scope = f"module {module_name}" if module_name else "repository"
+    files_str = "\n".join(file_paths)
+    return CLUSTER_FILES_PROMPT.format(scope=scope, files=files_str)
