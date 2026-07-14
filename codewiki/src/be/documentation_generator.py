@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 # Local imports
 from codewiki.src.be.dependency_analyzer import DependencyGraphBuilder
 from codewiki.src.be.backend import LLMBackend, get_backend
+from codewiki.src.be.checkpoint import CheckpointManager, PipelineStage
 from codewiki.src.be.prompt_template import (
     REPO_OVERVIEW_PROMPT,
     MODULE_OVERVIEW_PROMPT,
@@ -47,10 +48,17 @@ class IncompleteDocumentationError(Exception):
 class DocumentationGenerator:
     """Main documentation generation orchestrator."""
 
-    def __init__(self, config: Config, commit_id: str = None, backend: LLMBackend = None):
+    def __init__(
+        self,
+        config: Config,
+        commit_id: str = None,
+        backend: LLMBackend = None,
+        ckpt: CheckpointManager = None,
+    ):
         self.config = config
         self.commit_id = commit_id
         self.graph_builder = DependencyGraphBuilder(config)
+        self.ckpt = ckpt
         self.backend: LLMBackend = backend or get_backend(config)
     
     def create_documentation_metadata(self, working_dir: str, components: Dict[str, Any], num_leaf_nodes: int):
@@ -178,29 +186,40 @@ class DocumentationGenerator:
         # Get processing order (leaf modules first)
         processing_order = self.get_processing_order(first_module_tree)
 
-        
+        if self.ckpt is not None and processing_order:
+            task_ids = ["/".join(p) for p, _ in processing_order]
+            self.ckpt.register_tasks(task_ids, PipelineStage.LEAF_DOC)
+
         # Process modules in dependency order
         final_module_tree = module_tree
         processed_modules = set()
 
         if len(module_tree) > 0:
             for module_path, module_name in processing_order:
+                module_key = "/".join(module_path)
                 try:
+                    if self.ckpt is not None and self.ckpt.is_done(module_key):
+                        logger.info(f"[Resume] skipping completed module: {module_key}")
+                        processed_modules.add(module_key)
+                        continue
+
                     # Reload module tree to get latest hierarchical structure from sub-agent modifications
                     module_tree = file_manager.load_json(module_tree_path)
-                    
+
                     # Get the module info from the tree
                     module_info = module_tree
                     for path_part in module_path:
                         module_info = module_info[path_part]
                         if path_part != module_path[-1]:  # Not the last part
                             module_info = module_info.get("children", {})
-                    
+
                     # Skip if already processed
-                    module_key = "/".join(module_path)
                     if module_key in processed_modules:
                         continue
-                    
+
+                    if self.ckpt is not None:
+                        self.ckpt.mark_running(module_key)
+
                     # Process the module
                     if self.is_leaf_module(module_info):
                         logger.info(f"📄 Processing leaf module: {module_key}")
@@ -213,15 +232,31 @@ class DocumentationGenerator:
                         )
                     else:
                         logger.info(f"📁 Processing parent module: {module_key}")
-                        final_module_tree = await self.generate_parent_module_docs(
-                            module_path, working_dir
-                        )
-                    
+                        parent_md_path = os.path.join(working_dir, f"{module_name}.md")
+                        if (
+                            self.ckpt is not None
+                            and os.path.exists(parent_md_path)
+                            and self.ckpt.is_done(module_key)
+                        ):
+                            logger.info(
+                                f"[Resume] parent doc already complete for {module_key}; skipping regeneration"
+                            )
+                            final_module_tree = file_manager.load_json(module_tree_path)
+                        else:
+                            final_module_tree = await self.generate_parent_module_docs(
+                                module_path, working_dir
+                            )
+
+                    if self.ckpt is not None:
+                        self.ckpt.mark_done(module_key)
+
                     processed_modules.add(module_key)
-                    
+
                 except Exception as e:
                     logger.error(f"Failed to process module {module_key}: {str(e)}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
+                    if self.ckpt is not None:
+                        self.ckpt.mark_failed(module_key, str(e))
                     continue
 
             # Generate repo overview
@@ -312,18 +347,111 @@ class DocumentationGenerator:
     async def run(self) -> None:
         """Run the complete documentation generation process using dynamic programming."""
         try:
-            # Build dependency graph
-            components, leaf_nodes = self.graph_builder.build_dependency_graph()
+            # --- Checkpoint: Resume from analysis phase if available ---
+            analysis_done = False
+            if self.ckpt is not None and self.ckpt.is_done("dep_analysis"):
+                from codewiki.src.be.dependency_analyzer.utils.serialization import (
+                    load_analysis_artifacts,
+                )
+                artifacts_path = self.ckpt.state.analysis_artifacts_path
+                if artifacts_path and os.path.exists(artifacts_path):
+                    logger.info("[Resume] Loading analysis artifacts from checkpoint...")
+                    components, leaf_nodes = load_analysis_artifacts(artifacts_path)
+                    analysis_done = True
+                    logger.info(
+                        "[Resume] Skipped dependency analysis — loaded %d components, %d leaf nodes",
+                        len(components), len(leaf_nodes),
+                    )
+
+            if not analysis_done:
+                # Build dependency graph
+                components, leaf_nodes = self.graph_builder.build_dependency_graph()
+
+                # Strip source_code from all components to free memory (source is read
+                # from disk on demand during doc generation).  This can free 30-50+ MB
+                # for large repos with 10000+ components.
+                import gc
+                freed_bytes = 0
+                for node in components.values():
+                    if node.source_code is not None:
+                        freed_bytes += len(node.source_code.encode("utf-8"))
+                        node.source_code = None
+                gc.collect()
+                if freed_bytes > 0:
+                    logger.info(
+                        "[Memory] Freed %d bytes by stripping source_code from %d Node objects",
+                        freed_bytes, len(components),
+                    )
+
+                # Save analysis artifacts to checkpoint (lightweight, no source_code)
+                if self.ckpt is not None:
+                    from codewiki.src.be.dependency_analyzer.utils.serialization import (
+                        save_analysis_artifacts,
+                    )
+                    analysis_path = os.path.join(working_dir, "analysis_artifacts.json")
+                    save_analysis_artifacts(components, leaf_nodes, analysis_path)
+                    self.ckpt.set_stage_artifact("analysis_artifacts_path", analysis_path)
+                    self.ckpt.mark_done("dep_analysis")
 
             logger.debug(f"Found {len(leaf_nodes)} leaf nodes")
-            # logger.debug(f"Leaf nodes:\n{'\n'.join(sorted(leaf_nodes)[:200])}")
-            # exit()
             
             # Cluster modules
             working_dir = os.path.abspath(self.config.docs_dir)
             file_manager.ensure_directory(working_dir)
             first_module_tree_path = os.path.join(working_dir, FIRST_MODULE_TREE_FILENAME)
             module_tree_path = os.path.join(working_dir, MODULE_TREE_FILENAME)
+
+            if self.ckpt is not None:
+                dep_graph_path = os.path.join(working_dir, "dep_graph.json")
+                try:
+                    file_manager.save_json(
+                        {"components_count": len(components), "leaf_nodes": list(leaf_nodes)},
+                        dep_graph_path,
+                    )
+                    self.ckpt.set_stage_artifact("dep_graph_path", dep_graph_path)
+                except Exception as e:
+                    logger.warning(f"Failed to persist dep_graph artifact: {e}")
+
+            # --- Checkpoint: Resume from clustering phase if available ---
+            clustering_done = False
+            if self.ckpt is not None and self.ckpt.is_done("module_clustering"):
+                clustering_done = True
+                module_tree_path_artifact = self.ckpt.state.module_tree_path
+                if module_tree_path_artifact and os.path.exists(module_tree_path_artifact):
+                    module_tree = file_manager.load_json(module_tree_path_artifact)
+                    first_module_tree = file_manager.load_json(first_module_tree_path) if os.path.exists(first_module_tree_path) else module_tree
+                    logger.info("[Resume] Skipped module clustering — loaded cached module tree")
+                else:
+                    clustering_done = False  # Artifact missing, re-cluster
+
+            if not clustering_done:
+                # Check if module tree exists
+                if os.path.exists(first_module_tree_path):
+                    logger.debug(f"Module tree found at {first_module_tree_path}")
+                    module_tree = file_manager.load_json(first_module_tree_path)
+                else:
+                    logger.debug(f"Module tree not found at {module_tree_path}, clustering modules")
+                    clustering_tokens = get_clustering_input_token_count(
+                        leaf_nodes, components
+                    )
+                    logger.info(
+                        "Preparing %d leaf nodes for module clustering (%d tokens, threshold %d)",
+                        len(leaf_nodes),
+                        clustering_tokens,
+                        self.config.max_token_per_module,
+                    )
+                    cluster_model = self.config.cluster_model or None
+                    module_tree = cluster_modules(
+                        leaf_nodes,
+                        components,
+                        self.config,
+                        completer=lambda p: self.backend.complete(p, model=cluster_model),
+                        checkpoint=self.ckpt,
+                    )
+                    file_manager.save_json(module_tree, first_module_tree_path)
+
+                if self.ckpt is not None:
+                    self.ckpt.mark_done("module_clustering")
             
             # Check if module tree exists
             if os.path.exists(first_module_tree_path):
@@ -357,6 +485,9 @@ class DocumentationGenerator:
                 file_manager.save_json(module_tree, first_module_tree_path)
             
             file_manager.save_json(module_tree, module_tree_path)
+
+            if self.ckpt is not None:
+                self.ckpt.set_stage_artifact("module_tree_path", module_tree_path)
             
             if len(module_tree) == 0:
                 logger.info(
