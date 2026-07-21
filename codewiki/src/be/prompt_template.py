@@ -1,4 +1,5 @@
 SYSTEM_PROMPT = """
+{priority_directive}
 <ROLE>
 You are an AI documentation assistant. Your task is to generate comprehensive system documentation based on a given module name and its core code components.
 </ROLE>
@@ -50,6 +51,7 @@ You MUST call `str_replace_editor` with `command="create"` to write the `{module
 """.strip()
 
 LEAF_SYSTEM_PROMPT = """
+{priority_directive}
 <ROLE>
 You are an AI documentation assistant. Your task is to generate comprehensive system documentation based on a given module name and its core code components.
 </ROLE>
@@ -451,36 +453,72 @@ def format_system_prompt(module_name: str, custom_instructions: str = None) -> s
     """
     Format the system prompt with module name and optional custom instructions.
     
+    Custom instructions are placed BOTH at the top (as a <PRIORITY_DIRECTIVE>)
+    and at the end (as <CUSTOM_INSTRUCTIONS>) of the prompt. The top placement
+    ensures language/style directives (e.g. "write in Chinese") are not
+    drowned out by the dominant English prompt body.
+
     Args:
         module_name: Name of the module to document
         custom_instructions: Optional custom instructions to append
-        
+
     Returns:
         Formatted system prompt string
     """
     custom_section = ""
+    priority_directive = ""
     if custom_instructions:
         custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{custom_instructions}\n</CUSTOM_INSTRUCTIONS>"
-    
-    return SYSTEM_PROMPT.format(module_name=module_name, custom_instructions=custom_section).strip()
+        priority_directive = (
+            "<PRIORITY_DIRECTIVE>\n"
+            "The following instructions OVERRIDE the default behavior of this prompt. "
+            "You MUST follow them strictly, even if they conflict with the language or "
+            "style of the surrounding prompt.\n"
+            f"{custom_instructions}\n"
+            "</PRIORITY_DIRECTIVE>\n"
+        )
+
+    return SYSTEM_PROMPT.format(
+        module_name=module_name,
+        custom_instructions=custom_section,
+        priority_directive=priority_directive,
+    ).strip()
 
 
 def format_leaf_system_prompt(module_name: str, custom_instructions: str = None) -> str:
     """
     Format the leaf system prompt with module name and optional custom instructions.
-    
+
+    Custom instructions are placed BOTH at the top (as a <PRIORITY_DIRECTIVE>)
+    and at the end (as <CUSTOM_INSTRUCTIONS>) of the prompt. The top placement
+    ensures language/style directives (e.g. "write in Chinese") are not
+    drowned out by the dominant English prompt body.
+
     Args:
         module_name: Name of the module to document
         custom_instructions: Optional custom instructions to append
-        
+
     Returns:
         Formatted leaf system prompt string
     """
     custom_section = ""
+    priority_directive = ""
     if custom_instructions:
         custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{custom_instructions}\n</CUSTOM_INSTRUCTIONS>"
-    
-    return LEAF_SYSTEM_PROMPT.format(module_name=module_name, custom_instructions=custom_section).strip()
+        priority_directive = (
+            "<PRIORITY_DIRECTIVE>\n"
+            "The following instructions OVERRIDE the default behavior of this prompt. "
+            "You MUST follow them strictly, even if they conflict with the language or "
+            "style of the surrounding prompt.\n"
+            f"{custom_instructions}\n"
+            "</PRIORITY_DIRECTIVE>\n"
+        )
+
+    return LEAF_SYSTEM_PROMPT.format(
+        module_name=module_name,
+        custom_instructions=custom_section,
+        priority_directive=priority_directive,
+    ).strip()
 
 
 def format_file_cluster_prompt(file_paths: list[str], module_name: str = None) -> str:
