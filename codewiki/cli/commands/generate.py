@@ -337,6 +337,24 @@ def _invalidate_affected_modules(
     default=None,
     help="Analysis mode: coarse (fast, no sub-agent delegation), fine (deep, max_depth>=3), standard (default)",
 )
+@click.option(
+    "--no-kb",
+    is_flag=True,
+    default=False,
+    help="Skip knowledge base linking and HTTP server startup",
+)
+@click.option(
+    "--kb-dir",
+    type=str,
+    default=None,
+    help="Knowledge base directory (default: /work/SPK-OS/knowledge/base/raw/codewiki)",
+)
+@click.option(
+    "--kb-port",
+    type=int,
+    default=None,
+    help="HTTP server port for knowledge base (default: 8081)",
+)
 @click.pass_context
 def generate_command(
     ctx,
@@ -361,6 +379,9 @@ def generate_command(
     cache_dir: Optional[str] = None,
     concurrency: Optional[int] = None,
     mode: Optional[str] = None,
+    no_kb: bool = False,
+    kb_dir: Optional[str] = None,
+    kb_port: Optional[int] = None,
 ):
     """
     Generate comprehensive documentation for a code repository.
@@ -689,6 +710,21 @@ def generate_command(
                 'total_tokens_used': job.statistics.total_tokens_used,
             }
         )
+
+        # --- Knowledge base linking ---
+        if not no_kb:
+            from codewiki.cli.knowledge_base import (
+                link_to_knowledge_base,
+                DEFAULT_KB_DIR,
+                DEFAULT_KB_PORT,
+            )
+            link_to_knowledge_base(
+                output_dir=output_dir,
+                repo_name=repo_path.name,
+                repo_url=repo_url,
+                kb_dir=kb_dir or DEFAULT_KB_DIR,
+                kb_port=kb_port or DEFAULT_KB_PORT,
+            )
         
     except ConfigurationError as e:
         logger.error(e.message)
