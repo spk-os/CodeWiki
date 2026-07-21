@@ -101,6 +101,7 @@ Generate comprehensive documentation for the {module_name} module using the prov
 """.strip()
 
 REPO_OVERVIEW_PROMPT = """
+{priority_directive}
 You are an AI documentation assistant. Your task is to generate a brief overview of the {repo_name} repository.
 
 The overview should be a brief documentation of the repository, including:
@@ -117,9 +118,11 @@ Please generate the overview of the `{repo_name}` repository in markdown format 
 <OVERVIEW>
 overview_content
 </OVERVIEW>
+{custom_instructions}
 """.strip()
 
 MODULE_OVERVIEW_PROMPT = """
+{priority_directive}
 You are an AI documentation assistant. Your task is to generate a brief overview of `{module_name}` module.
 
 The overview should be a brief documentation of the module, including:
@@ -136,6 +139,7 @@ Please generate the overview of the `{module_name}` module in markdown format wi
 <OVERVIEW>
 overview_content
 </OVERVIEW>
+{custom_instructions}
 """.strip()
 
 CLUSTER_REPO_PROMPT = """
