@@ -23,7 +23,8 @@ import asyncio
 import logging
 import os
 import shutil
-from typing import Any, Dict, List
+import threading
+from typing import Any, Dict, List, Optional
 
 from caw import Agent as CawAgent
 from caw import ToolGroup
@@ -37,7 +38,7 @@ from codewiki.src.be.prompt_template import (
     format_system_prompt,
     format_user_prompt,
 )
-from codewiki.src.be.utils import count_tokens, is_complex_module, set_main_loop
+from codewiki.src.be.utils import count_tokens, is_complex_module, merge_module_tree, set_main_loop
 from codewiki.src.config import MODULE_TREE_FILENAME, OVERVIEW_FILENAME, Config
 from codewiki.src.utils import file_manager
 
@@ -271,16 +272,9 @@ class CawBackend(LLMBackend):
         core_component_ids: List[str],
         module_path: List[str],
         working_dir: str,
+        tree_lock: Optional[threading.RLock] = None,
     ) -> Dict[str, Any]:
-        # caw.completion shells out to a subprocess and blocks the calling
-        # thread.  Push it off the event loop so the rest of the async
-        # pipeline keeps moving.
-        # Mermaid validation goes through PythonMonkey, which binds its JS
-        # engine to the thread where it was first imported (the main
-        # thread).  caw routes MCP tool calls through a FastMCP daemon
-        # thread, so the validator would otherwise lose its event loop.
-        # Hand the main loop to utils so the worker-thread tool calls can
-        # marshal parse_mermaid_py back here.
+        self._tree_lock = tree_lock
         set_main_loop(asyncio.get_running_loop())
         return await asyncio.to_thread(
             self._run_module_agent_sync,
@@ -339,11 +333,12 @@ class CawBackend(LLMBackend):
         )
         num_tokens = count_tokens(components_with_code)
         can_delegate = (
-            is_complex_module(components, core_component_ids)
-            and start_depth < config.max_depth
+            config.analysis_mode != "coarse"
+            and is_complex_module(components, core_component_ids)
+            and start_depth < config.effective_max_depth
             and num_tokens >= config.max_token_per_leaf_module
         )
-        logger.info(f"Module {module_name} can delegate: {can_delegate} - is_complex_module: {is_complex_module(components, core_component_ids)} - start_depth: {start_depth} - num_tokens: {num_tokens} - max_depth: {config.max_depth} - max_token_per_leaf_module: {config.max_token_per_leaf_module}")
+        logger.info(f"Module {module_name} can delegate: {can_delegate} - is_complex_module: {is_complex_module(components, core_component_ids)} - start_depth: {start_depth} - num_tokens: {num_tokens} - effective_max_depth: {config.effective_max_depth} - max_token_per_leaf_module: {config.max_token_per_leaf_module}")
 
         if can_delegate:
             system_prompt = format_system_prompt(module_name, custom_instructions)
@@ -358,7 +353,7 @@ class CawBackend(LLMBackend):
             path_to_current_module=list(module_path),
             current_module_name=module_name,
             module_tree=module_tree,
-            max_depth=config.max_depth,
+            max_depth=config.effective_max_depth,
             current_depth=start_depth,
             config=config,
             custom_instructions=custom_instructions,
@@ -430,8 +425,33 @@ class CawBackend(LLMBackend):
                 traj.num_turns,
                 traj.total_tool_calls,
             )
-            file_manager.save_json(deps.module_tree, module_tree_path)
+            self._save_module_tree(module_tree_path, deps.module_tree, module_path)
             return deps.module_tree
         except Exception as e:
             logger.error("Error processing module %s via caw: %s", module_name, e)
             raise
+
+    def _save_module_tree(
+        self,
+        module_tree_path: str,
+        agent_tree: Dict[str, Any],
+        module_path: List[str],
+    ) -> None:
+        """Save module tree with lock + merge for concurrent safety.
+
+        When parallel leaf-module generation is enabled, multiple threads
+        may finish around the same time.  Each thread reloads the latest
+        tree from disk, merges only its own module entry, and saves the
+        merged tree — all under ``self._tree_lock``.
+        """
+        lock = getattr(self, "_tree_lock", None)
+        if lock is not None:
+            with lock:
+                latest_tree = file_manager.load_json(module_tree_path)
+                if latest_tree:
+                    merged = merge_module_tree(latest_tree, agent_tree, module_path)
+                    file_manager.save_json(merged, module_tree_path)
+                else:
+                    file_manager.save_json(agent_tree, module_tree_path)
+        else:
+            file_manager.save_json(agent_tree, module_tree_path)

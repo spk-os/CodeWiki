@@ -1,6 +1,8 @@
 import logging
 import os
 import json
+import asyncio
+import threading
 from typing import Dict, List, Any
 from copy import deepcopy
 import traceback
@@ -193,65 +195,128 @@ class DocumentationGenerator:
         # Process modules in dependency order
         final_module_tree = module_tree
         processed_modules = set()
+        tree_lock = threading.RLock()
 
         if len(module_tree) > 0:
+            # Split processing_order into leaf and parent modules.
+            # Leaf modules are independent (no dependency on other modules'
+            # docs) and can be processed in parallel.  Parent modules depend
+            # on their children's docs and must be processed sequentially
+            # in topological order.
+            leaf_modules = []
+            parent_modules = []
             for module_path, module_name in processing_order:
                 module_key = "/".join(module_path)
+                if self.ckpt is not None and self.ckpt.is_done(module_key):
+                    logger.info(f"[Resume] skipping completed module: {module_key}")
+                    processed_modules.add(module_key)
+                    continue
+
+                # Look up module info in first_module_tree to determine
+                # leaf vs. parent.  The tree may change during processing
+                # (sub-agents can add children), but the initial clustering
+                # result is the stable source of truth for the processing
+                # plan.
+                module_info = first_module_tree
+                for path_part in module_path:
+                    if path_part not in module_info:
+                        module_info = {}
+                        break
+                    module_info = module_info[path_part]
+                    if path_part != module_path[-1]:
+                        module_info = module_info.get("children", {})
+
+                if self.is_leaf_module(module_info):
+                    leaf_modules.append((module_path, module_name, module_key))
+                else:
+                    parent_modules.append((module_path, module_name, module_key))
+
+            if leaf_modules:
+                concurrency = self.config.effective_concurrency
+                semaphore = asyncio.Semaphore(concurrency)
+                logger.info(
+                    f"📄 Processing {len(leaf_modules)} leaf modules "
+                    f"with concurrency={concurrency}"
+                )
+
+                async def process_leaf(mp, mn, mk):
+                    async with semaphore:
+                        try:
+                            mt = file_manager.load_json(module_tree_path)
+                            mi = mt
+                            for pp in mp:
+                                mi = mi[pp]
+                                if pp != mp[-1]:
+                                    mi = mi.get("children", {})
+
+                            if self.ckpt is not None:
+                                self.ckpt.mark_running(mk)
+
+                            logger.info(f"📄 Processing leaf module: {mk}")
+                            await self.backend.run_module_agent(
+                                module_name=mn,
+                                components=components,
+                                core_component_ids=mi["components"],
+                                module_path=mp,
+                                working_dir=working_dir,
+                                tree_lock=tree_lock,
+                            )
+
+                            expected_md = os.path.join(working_dir, f"{mn}.md")
+                            if not os.path.exists(expected_md):
+                                raise RuntimeError(
+                                    f"Module agent completed but {mn}.md was not created"
+                                )
+
+                            if self.ckpt is not None:
+                                self.ckpt.mark_done(mk)
+                            processed_modules.add(mk)
+                        except Exception as e:
+                            logger.error(f"Failed to process module {mk}: {str(e)}")
+                            logger.error(f"Traceback: {traceback.format_exc()}")
+                            if self.ckpt is not None:
+                                self.ckpt.mark_failed(mk, str(e))
+
+                await asyncio.gather(
+                    *[process_leaf(mp, mn, mk) for mp, mn, mk in leaf_modules]
+                )
+
+            # Process parent modules sequentially (they depend on children's docs)
+            for module_path, module_name, module_key in parent_modules:
                 try:
-                    if self.ckpt is not None and self.ckpt.is_done(module_key):
-                        logger.info(f"[Resume] skipping completed module: {module_key}")
-                        processed_modules.add(module_key)
+                    if module_key in processed_modules:
                         continue
 
-                    # Reload module tree to get latest hierarchical structure from sub-agent modifications
                     module_tree = file_manager.load_json(module_tree_path)
 
-                    # Get the module info from the tree
                     module_info = module_tree
                     for path_part in module_path:
                         module_info = module_info[path_part]
-                        if path_part != module_path[-1]:  # Not the last part
+                        if path_part != module_path[-1]:
                             module_info = module_info.get("children", {})
-
-                    # Skip if already processed
-                    if module_key in processed_modules:
-                        continue
 
                     if self.ckpt is not None:
                         self.ckpt.mark_running(module_key)
 
-                    # Process the module
-                    if self.is_leaf_module(module_info):
-                        logger.info(f"📄 Processing leaf module: {module_key}")
-                        final_module_tree = await self.backend.run_module_agent(
-                            module_name=module_name,
-                            components=components,
-                            core_component_ids=module_info["components"],
-                            module_path=module_path,
-                            working_dir=working_dir,
+                    logger.info(f"📁 Processing parent module: {module_key}")
+                    parent_md_path = os.path.join(working_dir, f"{module_name}.md")
+                    if (
+                        self.ckpt is not None
+                        and os.path.exists(parent_md_path)
+                        and self.ckpt.is_done(module_key)
+                    ):
+                        logger.info(
+                            f"[Resume] parent doc already complete for {module_key}; skipping regeneration"
                         )
+                        final_module_tree = file_manager.load_json(module_tree_path)
                     else:
-                        logger.info(f"📁 Processing parent module: {module_key}")
-                        parent_md_path = os.path.join(working_dir, f"{module_name}.md")
-                        if (
-                            self.ckpt is not None
-                            and os.path.exists(parent_md_path)
-                            and self.ckpt.is_done(module_key)
-                        ):
-                            logger.info(
-                                f"[Resume] parent doc already complete for {module_key}; skipping regeneration"
-                            )
-                            final_module_tree = file_manager.load_json(module_tree_path)
-                        else:
-                            final_module_tree = await self.generate_parent_module_docs(
-                                module_path, working_dir
-                            )
+                        final_module_tree = await self.generate_parent_module_docs(
+                            module_path, working_dir
+                        )
 
                     if self.ckpt is not None:
                         self.ckpt.mark_done(module_key)
-
                     processed_modules.add(module_key)
-
                 except Exception as e:
                     logger.error(f"Failed to process module {module_key}: {str(e)}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
@@ -273,6 +338,7 @@ class DocumentationGenerator:
                 core_component_ids=leaf_nodes,
                 module_path=[],
                 working_dir=working_dir,
+                tree_lock=tree_lock,
             )
 
             # save final_module_tree to module_tree.json

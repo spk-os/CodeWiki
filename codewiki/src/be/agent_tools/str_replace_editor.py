@@ -734,7 +734,7 @@ class EditTool:
 
 async def str_replace_editor(
     ctx: RunContext[CodeWikiDeps],
-    working_dir: Literal["repo", "docs"],
+    working_dir: str,
     command: Literal["view", "create", "str_replace", "insert", "undo_edit"],
     path: Optional[str] = None,
     file: Optional[str] = None,
@@ -754,7 +754,7 @@ async def str_replace_editor(
         * Only `view` command is allowed when `working_dir` is `repo`.
 
     Args:
-        working_dir: The working directory to use. Choose `repo` to work with the repository files, or `docs` to work with the generated documentation files.
+        working_dir: The working directory to use. MUST be either 'repo' (to work with the repository source files) or 'docs' (to work with the generated documentation files). Do NOT pass a file path here — use the 'repo' or 'docs' keyword.
         command: The command to run. Allowed options are: `view`, `create`, `str_replace`, `insert`, `undo_edit`.
         path: Path to file or directory, e.g. `./chat_core.md` or `./agents/`
         file: Alias for `path` parameter (for compatibility with some models)
@@ -770,14 +770,34 @@ async def str_replace_editor(
     if path is None:
         path = file
 
+    # Normalize working_dir: accept any string and map to 'repo' or 'docs'.
+    # Some models pass a file path (e.g. '/') instead of the expected keyword.
+    working_dir_normalized = working_dir.strip().lower() if working_dir else ""
+    if working_dir_normalized == "repo":
+        resolved_working_dir = "repo"
+    elif working_dir_normalized == "docs":
+        resolved_working_dir = "docs"
+    elif "repo" in working_dir_normalized:
+        resolved_working_dir = "repo"
+    elif "doc" in working_dir_normalized:
+        resolved_working_dir = "docs"
+    else:
+        # Default to 'docs' for write/create operations, 'repo' for view-only
+        resolved_working_dir = "docs" if command != "view" else "repo"
+        logger.warning(
+            "str_replace_editor: working_dir='%s' is not 'repo' or 'docs'; "
+            "defaulting to '%s' for command='%s'",
+            working_dir, resolved_working_dir, command,
+        )
+
     tool = EditTool(ctx.deps.registry, ctx.deps.absolute_docs_path)
-    if working_dir == "docs":
+    if resolved_working_dir == "docs":
         absolute_path = str(Path(ctx.deps.absolute_docs_path) / path)
     else:
         absolute_path = str(Path(ctx.deps.absolute_repo_path) / path)
 
     # validate command
-    if command != "view" and working_dir == "repo":
+    if command != "view" and resolved_working_dir == "repo":
         return "The `view` command is the only allowed command when `working_dir` is `repo`."
 
     tool(
@@ -811,5 +831,6 @@ Custom editing tool for viewing, creating and editing files
     * The `undo_edit` command will revert the last edit made to the file at `path`
     * Only `view` command is allowed when `working_dir` is `repo`.
 """.strip(),
-    takes_ctx=True
+    takes_ctx=True,
+    max_retries=3,
 )

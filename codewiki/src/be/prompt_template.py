@@ -37,8 +37,12 @@ Generate documentation following this structure:
 5. After all sub-modules are documented, adjust `{module_name}.md` with ONLY ONE STEP to ensure all generated files including sub-modules documentation are properly cross-refered, using the final file names reported by `generate_sub_module_documentation`
 </WORKFLOW>
 
+<CRITICAL_INSTRUCTION>
+You MUST call `str_replace_editor` with `command="create"` to write the `{module_name}.md` file to disk. Do NOT simply output the documentation as text in your response — the file MUST be created via the tool. If you do not call `str_replace_editor` with `command="create"`, the documentation will not be saved and the task will fail.
+</CRITICAL_INSTRUCTION>
+
 <AVAILABLE_TOOLS>
-- `str_replace_editor`: File system operations for creating and editing documentation files
+- `str_replace_editor`: File system operations for creating and editing documentation files. Use `command="create"` with `path="{module_name}.md"`, `working_dir="docs"`, and `file_text=<content>` to create the documentation file.
 - `read_code_components`: Explore additional code dependencies not included in the provided components
 - `generate_sub_module_documentation`: Generate detailed documentation for individual sub-modules via sub-agents
 </AVAILABLE_TOOLS>
@@ -66,12 +70,16 @@ Generate documentation following the following requirements:
 
 <WORKFLOW>
 1. Analyze provided code components and module structure
-2. Explore dependencies between components if needed
-3. Generate complete {module_name}.md documentation file
+2. Explore dependencies between components if needed using `read_code_components`
+3. Write the complete documentation to a file named `{module_name}.md` using `str_replace_editor` with `command="create"`, `path="{module_name}.md"`, `working_dir="docs"`, and `file_text=<your full documentation content>`
 </WORKFLOW>
 
+<CRITICAL_INSTRUCTION>
+You MUST call `str_replace_editor` with `command="create"` to write the `{module_name}.md` file to disk. Do NOT simply output the documentation as text in your response — the file MUST be created via the tool. If you do not call `str_replace_editor` with `command="create"`, the documentation will not be saved and the task will fail.
+</CRITICAL_INSTRUCTION>
+
 <AVAILABLE_TOOLS>
-- `str_replace_editor`: File system operations for creating and editing documentation files
+- `str_replace_editor`: File system operations for creating and editing documentation files. Use `command="create"` with `path="{module_name}.md"`, `working_dir="docs"`, and `file_text=<content>` to create the documentation file.
 - `read_code_components`: Explore additional code dependencies not included in the provided components
 </AVAILABLE_TOOLS>
 {custom_instructions}

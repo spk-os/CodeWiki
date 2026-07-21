@@ -4,13 +4,59 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 import logging
 import tiktoken
 import traceback
 
 
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# ----------------- Module Tree Merge (concurrent) -----------
+# ------------------------------------------------------------
+
+def merge_module_tree(
+    latest_tree: Dict[str, Any],
+    agent_tree: Dict[str, Any],
+    module_path: List[str],
+) -> Dict[str, Any]:
+    """Merge an agent's in-memory module-tree changes into *latest_tree*.
+
+    Each agent only modifies the entry at its own *module_path*.  When
+    multiple agents run in parallel, a naive ``save_json(deps.module_tree)``
+    would clobber other agents' modifications.  This function replaces
+    **only** the entry at *module_path* in *latest_tree*, preserving all
+    other entries.  Intermediate nodes are created in *latest_tree* if
+    missing (parent agent added sub-modules in memory but hasn't saved yet).
+    """
+    if not module_path:
+        return agent_tree
+
+    target = latest_tree
+    for part in module_path[:-1]:
+        if part not in target:
+            target[part] = {"components": [], "children": {}}
+        target = target[part]
+        if "children" not in target:
+            target["children"] = {}
+        target = target["children"]
+
+    agent_target = agent_tree
+    for part in module_path[:-1]:
+        if part not in agent_target:
+            return latest_tree
+        agent_target = agent_target[part]
+        if "children" not in agent_target:
+            agent_target["children"] = {}
+        agent_target = agent_target["children"]
+
+    module_name = module_path[-1]
+    if module_name in agent_target:
+        target[module_name] = agent_target[module_name]
+
+    return latest_tree
 
 
 # PythonMonkey (used by mermaid_parser.parse_mermaid_py) binds its JS engine

@@ -90,6 +90,8 @@ class Config:
     llm_timeout: int = DEFAULT_LLM_TIMEOUT
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL
+    # Analysis mode: "standard" (default), "coarse" (fast, shallow), "fine" (detailed, deep)
+    analysis_mode: str = "standard"
 
     def __post_init__(self):
         # When multi-key api_keys is configured but llm_api_key is empty or
@@ -124,6 +126,14 @@ class Config:
         if self.concurrency and self.concurrency > 0:
             return self.concurrency
         return max(1, len(self.effective_keys))
+
+    @property
+    def effective_max_depth(self) -> int:
+        if self.analysis_mode == "coarse":
+            return 1
+        if self.analysis_mode == "fine":
+            return max(self.max_depth, 3)
+        return self.max_depth
 
     MODEL_CONTEXT_MAP = {
         "deepseek-v4-flash-free": 1048565,
@@ -263,6 +273,7 @@ class Config:
         llm_timeout: int = DEFAULT_LLM_TIMEOUT,
         llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES,
         llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL,
+        analysis_mode: str = "standard",
     ) -> 'Config':
         """
         Create configuration for CLI context.
@@ -319,4 +330,5 @@ class Config:
             llm_timeout=llm_timeout,
             llm_max_retries=llm_max_retries,
             llm_retry_interval=llm_retry_interval,
+            analysis_mode=analysis_mode,
         )

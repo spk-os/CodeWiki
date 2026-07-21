@@ -331,6 +331,12 @@ def _invalidate_affected_modules(
     default=None,
     help="Override max concurrent LLM calls",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(['standard', 'coarse', 'fine'], case_sensitive=False),
+    default=None,
+    help="Analysis mode: coarse (fast, no sub-agent delegation), fine (deep, max_depth>=3), standard (default)",
+)
 @click.pass_context
 def generate_command(
     ctx,
@@ -354,6 +360,7 @@ def generate_command(
     clear_cache: bool = False,
     cache_dir: Optional[str] = None,
     concurrency: Optional[int] = None,
+    mode: Optional[str] = None,
 ):
     """
     Generate comprehensive documentation for a code repository.
@@ -401,6 +408,17 @@ def generate_command(
     """
     logger = create_logger(verbose=verbose)
     start_time = time.time()
+
+    if instructions:
+        instructions = instructions.encode('utf-8', errors='replace').decode('utf-8')
+    if include:
+        include = include.encode('utf-8', errors='replace').decode('utf-8')
+    if exclude:
+        exclude = exclude.encode('utf-8', errors='replace').decode('utf-8')
+    if focus:
+        focus = focus.encode('utf-8', errors='replace').decode('utf-8')
+    if doc_type:
+        doc_type = doc_type.encode('utf-8', errors='replace').decode('utf-8')
     
     # Suppress httpx INFO logs
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -630,6 +648,7 @@ def generate_command(
                 'llm_timeout': config.llm_timeout,
                 'llm_max_retries': config.llm_max_retries,
                 'llm_retry_interval': config.llm_retry_interval,
+                'analysis_mode': mode or 'standard',
             },
             verbose=verbose,
             generate_html=github_pages,

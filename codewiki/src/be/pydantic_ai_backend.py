@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic_ai import Agent
+from pydantic_ai.usage import UsageLimits
 
 from codewiki.src.be.agent_tools.deps import CodeWikiDeps
 from codewiki.src.be.agent_tools.generate_sub_module_documentations import (
@@ -30,7 +32,7 @@ from codewiki.src.be.prompt_template import (
     format_system_prompt,
     format_user_prompt,
 )
-from codewiki.src.be.utils import is_complex_module
+from codewiki.src.be.utils import is_complex_module, merge_module_tree
 from codewiki.src.config import MODULE_TREE_FILENAME, OVERVIEW_FILENAME, Config
 from codewiki.src.utils import file_manager
 
@@ -73,21 +75,32 @@ class PydanticAIBackend(LLMBackend):
         core_component_ids: List[str],
         module_path: List[str],
         working_dir: str,
+        tree_lock: Optional[threading.RLock] = None,
     ) -> Dict[str, Any]:
         config = self._config
+        self._tree_lock = tree_lock
         module_tree_path = os.path.join(working_dir, MODULE_TREE_FILENAME)
         module_tree = file_manager.load_json(module_tree_path)
 
-        overview_docs_path = os.path.join(working_dir, OVERVIEW_FILENAME)
-        if os.path.exists(overview_docs_path):
-            logger.info("✓ Overview docs already exists at %s", overview_docs_path)
-            return module_tree
+        # The overview check only applies in whole-repo mode (empty module_path).
+        # For individual leaf/parent modules, overview.md existing is expected
+        # (it was generated in a previous run) and must NOT short-circuit the
+        # module's own documentation generation.
+        if not module_path:
+            overview_docs_path = os.path.join(working_dir, OVERVIEW_FILENAME)
+            if os.path.exists(overview_docs_path):
+                logger.info("✓ Overview docs already exists at %s", overview_docs_path)
+                return module_tree
         docs_path = os.path.join(working_dir, f"{module_name}.md")
         if os.path.exists(docs_path):
             logger.info("✓ Module docs already exists at %s", docs_path)
             return module_tree
 
-        if is_complex_module(components, core_component_ids):
+        use_delegation = (
+            config.analysis_mode != "coarse"
+            and is_complex_module(components, core_component_ids)
+        )
+        if use_delegation:
             agent = Agent(
                 self._fallback_models,
                 name=module_name,
@@ -118,14 +131,14 @@ class PydanticAIBackend(LLMBackend):
             path_to_current_module=module_path,
             current_module_name=module_name,
             module_tree=module_tree,
-            max_depth=config.max_depth,
+            max_depth=config.effective_max_depth,
             current_depth=1,
             config=config,
             custom_instructions=self._custom_instructions,
         )
 
         try:
-            await agent.run(
+            result = await agent.run(
                 format_user_prompt(
                     module_name=module_name,
                     core_component_ids=core_component_ids,
@@ -134,8 +147,23 @@ class PydanticAIBackend(LLMBackend):
                     context_window=config.effective_context_window,
                 ),
                 deps=deps,
+                usage_limits=UsageLimits(request_limit=None),
             )
-            file_manager.save_json(deps.module_tree, module_tree_path)
+            result_data = result.data if hasattr(result, 'data') else str(result)
+            result_preview = (result_data[:500] + '...') if len(str(result_data)) > 500 else str(result_data)
+            usage = result.usage if hasattr(result, 'usage') else None
+            logger.info(
+                "[Agent] Module=%s | Output length=%d | Usage=%s | Preview: %s",
+                module_name, len(str(result_data)), usage, result_preview,
+            )
+            expected_md = os.path.join(working_dir, f"{module_name}.md")
+            if not os.path.exists(expected_md):
+                logger.warning(
+                    "[Agent] Module %s: agent completed but %s was NOT created. "
+                    "The agent may not have called str_replace_editor with command='create'.",
+                    module_name, expected_md,
+                )
+            self._save_module_tree(deps.module_tree, module_tree_path, module_path)
             if self._ckpt is not None:
                 module_key = "/".join(module_path) if module_path else module_name
                 self._ckpt.mark_done(module_key)
@@ -147,3 +175,19 @@ class PydanticAIBackend(LLMBackend):
                 module_key = "/".join(module_path) if module_path else module_name
                 self._ckpt.mark_failed(module_key, str(e))
             raise
+
+    def _save_module_tree(
+        self,
+        agent_tree: Dict[str, Any],
+        module_tree_path: str,
+        module_path: List[str],
+    ) -> None:
+        """Persist module tree, merging with on-disk version under tree_lock."""
+        lock = getattr(self, "_tree_lock", None)
+        if lock is not None:
+            with lock:
+                latest = file_manager.load_json(module_tree_path)
+                merged = merge_module_tree(latest, agent_tree, module_path)
+                file_manager.save_json(merged, module_tree_path)
+        else:
+            file_manager.save_json(agent_tree, module_tree_path)

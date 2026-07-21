@@ -2,51 +2,55 @@
 Logging utilities for CLI with colored output and progress tracking.
 """
 
-import sys
 from datetime import datetime
 from typing import Optional
 import click
 
 
 class CLILogger:
-    """Logger for CLI with support for verbose and normal modes."""
-    
+    """Logger for CLI with support for colored output and progress tracking."""
+
     def __init__(self, verbose: bool = False):
         """
         Initialize the logger.
-        
+
         Args:
             verbose: Enable verbose output
         """
         self.verbose = verbose
         self.start_time = datetime.now()
-    
+
+    @staticmethod
+    def _safe(message: str) -> str:
+        """Replace surrogate code points (U+D800–U+DFFF) so stdout doesn't crash."""
+        return message.encode('utf-8', errors='replace').decode('utf-8')
+
     def debug(self, message: str):
         """Log debug message (only in verbose mode)."""
         if self.verbose:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            click.secho(f"[{timestamp}] {message}", fg="cyan", dim=True)
-    
+            click.secho(self._safe(f"[{timestamp}] {message}"), fg="cyan", dim=True)
+
     def info(self, message: str):
         """Log info message."""
-        click.echo(message)
-    
+        click.echo(self._safe(message))
+
     def success(self, message: str):
         """Log success message in green."""
-        click.secho(f"✓ {message}", fg="green")
-    
+        click.secho(self._safe(f"✓ {message}"), fg="green")
+
     def warning(self, message: str):
         """Log warning message in yellow."""
-        click.secho(f"⚠️  {message}", fg="yellow")
-    
+        click.secho(self._safe(f"⚠️  {message}"), fg="yellow")
+
     def error(self, message: str):
         """Log error message in red."""
-        click.secho(f"✗ {message}", fg="red", err=True)
-    
+        click.secho(self._safe(f"✗ {message}"), fg="red", err=True)
+
     def step(self, message: str, step: Optional[int] = None, total: Optional[int] = None):
         """
         Log a processing step.
-        
+
         Args:
             message: Step description
             step: Current step number
@@ -56,8 +60,8 @@ class CLILogger:
             prefix = f"[{step}/{total}]"
         else:
             prefix = "→"
-        
-        click.secho(f"{prefix} {message}", fg="blue", bold=True)
+
+        click.secho(self._safe(f"{prefix} {message}"), fg="blue", bold=True)
     
     def elapsed_time(self) -> str:
         """Get elapsed time since logger was created."""

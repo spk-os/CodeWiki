@@ -18,7 +18,8 @@ Provider selection happens in one place: :func:`get_backend`.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Any, Dict, List
+import threading
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from codewiki.src.be.dependency_analyzer.models.core import Node
@@ -53,8 +54,14 @@ class LLMBackend(abc.ABC):
         core_component_ids: List[str],
         module_path: List[str],
         working_dir: str,
+        tree_lock: Optional[threading.RLock] = None,
     ) -> Dict[str, Any]:
-        """Run the per-module agent loop.  Returns the updated module_tree dict."""
+        """Run the per-module agent loop.  Returns the updated module_tree dict.
+
+        When *tree_lock* is provided, the implementation must hold it while
+        saving the module tree to disk so parallel agents don't clobber
+        each other's modifications.
+        """
 
 
 def get_backend(config) -> "LLMBackend":
