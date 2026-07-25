@@ -22,6 +22,11 @@ class TreeSitterJSAnalyzer:
     def __init__(self, file_path: str, content: str, repo_path: str = None):
         self.file_path = Path(file_path)
         self.content = content
+        # Cache the UTF-8 bytes once. _get_node_text slices this per call;
+        # re-encoding the whole file on every node lookup is O(file_size) per
+        # call, which turns AST traversal into O(nodes * file_size) — the
+        # ~3-hour hang on multi-MB minified bundles.
+        self._content_bytes = content.encode("utf8", errors="replace")
         self.repo_path = repo_path or ""
         self.nodes: List[Node] = []
         self.call_relationships: List[CallRelationship] = []
@@ -594,9 +599,21 @@ class TreeSitterJSAnalyzer:
 
     def _receiver_class(self, call_node, identifier: str) -> Optional[str]:
         """Find the class of a local identifier from a `new X()` initializer
-        in an enclosing scope."""
+        in an enclosing scope.
+
+        Bounded: walks at most ``_MAX_SCOPE_WALK`` enclosing scopes and, per
+        scope, visits at most ``_MAX_INITIALIZER_SEARCH`` nodes. Without these
+        caps a single unresolved member call triggers a full-subtree DFS up to
+        the ``program`` root; on a multi-MB minified bundle (hundreds of
+        thousands of AST nodes + tens of thousands of member calls) that is
+        O(n^2) and hangs the analyzer for hours. The caps turn the worst case
+        into a fast no-op while preserving the common-case resolution (a
+        ``new X()`` initializer lives in a nearby enclosing scope, not deep in
+        a far-away subtree).
+        """
         scope = call_node.parent
-        while scope:
+        depth = 0
+        while scope is not None and depth < self._MAX_SCOPE_WALK:
             if scope.type in (
                 "method_definition", "function_declaration",
                 "generator_function_declaration", "arrow_function",
@@ -606,12 +623,26 @@ class TreeSitterJSAnalyzer:
                 if found:
                     return found
             scope = scope.parent
+            depth += 1
         return None
+
+    # Max enclosing scopes to walk looking for a `new X()` initializer, and max
+    # nodes to visit per scope. Bounds _receiver_class so pathological inputs
+    # (huge minified bundles) can't go O(n^2).
+    _MAX_SCOPE_WALK = 6
+    _MAX_INITIALIZER_SEARCH = 3000
 
     def _find_new_initializer(self, scope_node, identifier: str) -> Optional[str]:
         stack = [scope_node]
+        visited = 0
         while stack:
             current = stack.pop()
+            visited += 1
+            if visited > self._MAX_INITIALIZER_SEARCH:
+                # Bail out: this scope is too large to scan exhaustively
+                # (typical of minified bundles). Losing one local's class
+                # resolution is preferable to hanging the whole file.
+                return None
             if current.type == "variable_declarator":
                 name_node = self._find_child_by_type(current, "identifier")
                 if name_node is not None and self._get_node_text(name_node) == identifier:
@@ -753,9 +784,8 @@ class TreeSitterJSAnalyzer:
         return None
 
     def _get_node_text(self, node) -> str:
-        start_byte = node.start_byte
-        end_byte = node.end_byte
-        return self.content.encode("utf8")[start_byte:end_byte].decode("utf8")
+        # Slice the pre-encoded bytes (O(slice), not O(file) per call).
+        return self._content_bytes[node.start_byte:node.end_byte].decode("utf8", errors="replace")
 
     def _find_containing_class_name(self, method_node) -> Optional[str]:
         current = method_node.parent

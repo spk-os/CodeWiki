@@ -22,6 +22,10 @@ class TreeSitterTSAnalyzer:
     def __init__(self, file_path: str, content: str, repo_path: str = None):
         self.file_path = Path(file_path)
         self.content = content
+        # Cache UTF-8 bytes once; _get_node_text slices this per call. Re-encoding
+        # the whole file on every node lookup is O(file_size) per call → O(n^2)
+        # traversal, which hangs the analyzer for hours on large/minified files.
+        self._content_bytes = content.encode("utf8", errors="replace")
         self.repo_path = repo_path or ""
         self.nodes: List[Node] = []
         self.call_relationships: List[CallRelationship] = []
@@ -938,10 +942,17 @@ class TreeSitterTSAnalyzer:
 
     def _infer_identifier_type(self, call_node, identifier: str) -> Optional[str]:
         """Find the type of a local identifier from `new X()` initializers or
-        TS type annotations within the enclosing function/method/class."""
+        TS type annotations within the enclosing function/method/class.
+
+        Bounded: walks at most ``_MAX_SCOPE_WALK`` enclosing scopes and, per
+        scope, visits at most ``_MAX_DECLARED_TYPE_SEARCH`` nodes. Without caps
+        a single unresolved receiver triggers a full-subtree DFS up to the
+        ``program`` root → O(n^2) on large files (hours-long hang).
+        """
         scope = call_node.parent
         scopes = []
-        while scope:
+        depth = 0
+        while scope is not None and depth < self._MAX_SCOPE_WALK:
             if scope.type in (
                 "method_definition", "function_declaration",
                 "generator_function_declaration", "arrow_function",
@@ -950,6 +961,7 @@ class TreeSitterTSAnalyzer:
             ):
                 scopes.append(scope)
             scope = scope.parent
+            depth += 1
 
         for scope_node in scopes:
             found = self._find_declared_type(scope_node, identifier)
@@ -957,10 +969,23 @@ class TreeSitterTSAnalyzer:
                 return found
         return None
 
+    # Bounds for _infer_identifier_type: max enclosing scopes and max nodes
+    # visited per scope, so pathological inputs (large/minified files) can't
+    # go O(n^2). A real declaration lives in a nearby enclosing scope, not
+    # deep in a far-away subtree, so the caps rarely affect normal code.
+    _MAX_SCOPE_WALK = 6
+    _MAX_DECLARED_TYPE_SEARCH = 3000
+
     def _find_declared_type(self, scope_node, identifier: str) -> Optional[str]:
         stack = [scope_node]
+        visited = 0
         while stack:
             current = stack.pop()
+            visited += 1
+            if visited > self._MAX_DECLARED_TYPE_SEARCH:
+                # Scope too large to scan exhaustively (minified bundles);
+                # losing one local's type inference beats hanging the file.
+                return None
             if current.type == "variable_declarator":
                 name_node = self._find_child_by_type(current, "identifier")
                 if name_node is not None and self._get_node_text(name_node) == identifier:
@@ -1113,9 +1138,8 @@ class TreeSitterTSAnalyzer:
         return None
 
     def _get_node_text(self, node) -> str:
-        start_byte = node.start_byte
-        end_byte = node.end_byte
-        return self.content.encode("utf8")[start_byte:end_byte].decode("utf8")
+        # Slice the pre-encoded bytes (O(slice), not O(file) per call).
+        return self._content_bytes[node.start_byte:node.end_byte].decode("utf8", errors="replace")
 
 
 
