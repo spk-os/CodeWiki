@@ -50,7 +50,27 @@
             "codewiki/src/be/agent_tools/str_replace_editor.py::Filemap",
             "codewiki/src/be/caw_toolkit.py::CawToolKit"
         ],
-        "children": {}
+        "children": {
+            "agent_tools_edit": {
+                "components": [
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::EditTool",
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::WindowExpander",
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::Filemap",
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::Flake8Error",
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::format_flake8_output",
+                    "codewiki/src/be/agent_tools/str_replace_editor.py::maybe_truncate"
+                ],
+                "children": {}
+            },
+            "agent_tools_toolkit": {
+                "components": [
+                    "codewiki/src/be/caw_toolkit.py::CawToolKit",
+                    "codewiki/src/be/caw_toolkit.py::_heartbeat",
+                    "codewiki/src/be/caw_toolkit.py::_coerce_json_arg"
+                ],
+                "children": {}
+            }
+        }
     },
     "documentation_generation": {
         "path": "codewiki/src/be/documentation_generator.py",
@@ -82,63 +102,7 @@
             "codewiki/src/be/dependency_analyzer/analyzers/python.py::PythonASTAnalyzer",
             "codewiki/src/be/dependency_analyzer/analyzers/typescript.py::TreeSitterTSAnalyzer"
         ],
-        "children": {
-            "c_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/c.py::TreeSitterCAnalyzer"
-                ],
-                "children": {}
-            },
-            "cpp_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/cpp.py::TreeSitterCppAnalyzer"
-                ],
-                "children": {}
-            },
-            "csharp_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/csharp.py::TreeSitterCSharpAnalyzer"
-                ],
-                "children": {}
-            },
-            "java_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/java.py::TreeSitterJavaAnalyzer"
-                ],
-                "children": {}
-            },
-            "javascript_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/javascript.py::TreeSitterJSAnalyzer"
-                ],
-                "children": {}
-            },
-            "kotlin_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/kotlin.py::TreeSitterKotlinAnalyzer"
-                ],
-                "children": {}
-            },
-            "php_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/php.py::NamespaceResolver",
-                    "codewiki/src/be/dependency_analyzer/analyzers/php.py::TreeSitterPHPAnalyzer"
-                ],
-                "children": {}
-            },
-            "python_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/python.py::PythonASTAnalyzer"
-                ],
-                "children": {}
-            },
-            "typescript_analyzer": {
-                "components": [
-                    "codewiki/src/be/dependency_analyzer/analyzers/typescript.py::TreeSitterTSAnalyzer"
-                ],
-                "children": {}
-            }
-        }
+        "children": {}
     },
     "dependency_graph_construction": {
         "path": "codewiki/src/be/dependency_analyzer",
