@@ -143,17 +143,47 @@ def _resolve_prompt(prompt_type: str, variables: Dict[str, Any]) -> str:
     elif prompt_type == "overview_module":
         module_name = variables.get("module_name", "MODULE_NAME")
         repo_structure = variables.get("repo_structure", "<REPO_STRUCTURE placeholder>")
+        _ci = variables.get("custom_instructions", None)
+        _custom_section = ""
+        _priority_directive = ""
+        if _ci:
+            _custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{_ci}\n</CUSTOM_INSTRUCTIONS>"
+            _priority_directive = (
+                "<PRIORITY_DIRECTIVE>\n"
+                "The following instructions OVERRIDE the default behavior of this prompt. "
+                "You MUST follow them strictly, even if they conflict with the language or "
+                "style of the surrounding prompt.\n"
+                f"{_ci}\n"
+                "</PRIORITY_DIRECTIVE>\n"
+            )
         return MODULE_OVERVIEW_PROMPT.format(
             module_name=module_name,
             repo_structure=repo_structure if isinstance(repo_structure, str) else json.dumps(repo_structure, indent=4),
+            custom_instructions=_custom_section,
+            priority_directive=_priority_directive,
         )
 
     elif prompt_type == "overview_repo":
         repo_name = variables.get("repo_name", "REPO_NAME")
         repo_structure = variables.get("repo_structure", "<REPO_STRUCTURE placeholder>")
+        _ci = variables.get("custom_instructions", None)
+        _custom_section = ""
+        _priority_directive = ""
+        if _ci:
+            _custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{_ci}\n</CUSTOM_INSTRUCTIONS>"
+            _priority_directive = (
+                "<PRIORITY_DIRECTIVE>\n"
+                "The following instructions OVERRIDE the default behavior of this prompt. "
+                "You MUST follow them strictly, even if they conflict with the language or "
+                "style of the surrounding prompt.\n"
+                f"{_ci}\n"
+                "</PRIORITY_DIRECTIVE>\n"
+            )
         return REPO_OVERVIEW_PROMPT.format(
             repo_name=repo_name,
             repo_structure=repo_structure if isinstance(repo_structure, str) else json.dumps(repo_structure, indent=4),
+            custom_instructions=_custom_section,
+            priority_directive=_priority_directive,
         )
 
     return f"Unknown prompt type: {prompt_type}"

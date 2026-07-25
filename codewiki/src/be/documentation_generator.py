@@ -393,12 +393,30 @@ class DocumentationGenerator:
         # Create repo structure with 1-depth children docs and target indicator
         repo_structure = self.build_overview_structure(module_tree, module_path, working_dir)
 
+        _ci = self.config.get_prompt_addition()
+        _custom_section = ""
+        _priority_directive = ""
+        if _ci:
+            _custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{_ci}\n</CUSTOM_INSTRUCTIONS>"
+            _priority_directive = (
+                "<PRIORITY_DIRECTIVE>\n"
+                "The following instructions OVERRIDE the default behavior of this prompt. "
+                "You MUST follow them strictly, even if they conflict with the language or "
+                "style of the surrounding prompt.\n"
+                f"{_ci}\n"
+                "</PRIORITY_DIRECTIVE>\n"
+            )
+
         prompt = MODULE_OVERVIEW_PROMPT.format(
             module_name=module_name,
-            repo_structure=json.dumps(repo_structure, indent=4)
+            repo_structure=json.dumps(repo_structure, indent=4),
+            custom_instructions=_custom_section,
+            priority_directive=_priority_directive,
         ) if len(module_path) >= 1 else REPO_OVERVIEW_PROMPT.format(
             repo_name=module_name,
-            repo_structure=json.dumps(repo_structure, indent=4)
+            repo_structure=json.dumps(repo_structure, indent=4),
+            custom_instructions=_custom_section,
+            priority_directive=_priority_directive,
         )
         
         try:

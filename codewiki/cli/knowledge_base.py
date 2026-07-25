@@ -70,6 +70,9 @@ def link_to_knowledge_base(
         logger.warning("Cannot create symlink %s: %s", link_path, exc)
         return
 
+    # --- 1b. Ensure HTML viewer exists ---
+    _ensure_html_viewer(Path(abs_output), repo_name)
+
     # --- 2. Update index.html ---
     _update_index_html(kb_path, repo_name, repo_url)
 
@@ -97,6 +100,30 @@ def link_to_knowledge_base(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _ensure_html_viewer(docs_dir: Path, repo_name: str) -> None:
+    """Generate ``index.html`` viewer in *docs_dir* if missing."""
+    index_path = docs_dir / "index.html"
+    if index_path.exists():
+        return
+
+    try:
+        from codewiki.cli.html_generator import HTMLGenerator
+
+        html_gen = HTMLGenerator()
+        repo_path = docs_dir.parent
+        repo_info = html_gen.detect_repository_info(repo_path)
+        html_gen.generate(
+            output_path=index_path,
+            title=repo_info.get("name") or repo_name,
+            repository_url=repo_info.get("url"),
+            github_pages_url=repo_info.get("github_pages_url"),
+            docs_dir=docs_dir,
+        )
+        logger.info("Generated HTML viewer at %s", index_path)
+    except Exception as exc:
+        logger.warning("Cannot generate HTML viewer: %s", exc)
+
 
 def _update_index_html(kb_path: Path, new_repo: str, repo_url: Optional[str] = None) -> None:
     """Scan *kb_path* for all repo symlinks and regenerate ``index.html``."""

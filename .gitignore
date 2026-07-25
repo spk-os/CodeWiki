@@ -73,3 +73,13 @@ Thumbs.db
 *.log
 *.bak
 .codewiki/
+
+# runtime/cache/artifacts — never commit
+.codewiki_cache/
+.omo/
+nohup.out
+temp.yaml
+docs_zh_bak/
+docs/agent_tools*.md
+docs/analysis_artifacts.json
+docs/optimization_analysis.md
