@@ -111,6 +111,47 @@ def _subdirs(path: Path) -> List[Path]:
     return out
 
 
+def _assess_split(
+    sp: SplitPoint, min_files: int, min_bytes: int
+) -> Tuple[bool, str, int, int]:
+    """Decide whether a split point has enough code to be worth running.
+
+    Walks *sp.abs_path* for supported code files (skipping junk dirs) and
+    returns ``(should_run, reason, file_count, total_bytes)``. A split is
+    skipped when it has no supported code, too few files, or too few bytes —
+    these would only fail inside the sub-run anyway (e.g. ``validate_repository``
+    raises on empty dirs), so skipping them up front avoids wasted subprocess
+    + LLM cost and keeps ``split_state`` honest (``skipped`` vs ``failed``).
+
+    Set ``min_files=0`` and ``min_bytes=0`` to disable pre-assessment.
+    """
+    from codewiki.cli.utils.repo_validator import SUPPORTED_EXTENSIONS
+
+    file_count = 0
+    total_bytes = 0
+    for root, dirs, files in os.walk(sp.abs_path):
+        # Prune junk + hidden dirs in-place so os.walk doesn't descend.
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            file_count += 1
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                pass
+
+    if file_count == 0:
+        return False, "no supported code files", file_count, total_bytes
+    if min_files > 0 and file_count < min_files:
+        return False, "too few code files ({})".format(file_count), file_count, total_bytes
+    if min_bytes > 0 and total_bytes < min_bytes:
+        return False, "code too small ({} bytes)".format(total_bytes), file_count, total_bytes
+    return True, "ok", file_count, total_bytes
+
+
+
 def find_split_points(
     root: Path, global_depth: int, overrides: Dict[str, int]
 ) -> List[SplitPoint]:
@@ -325,32 +366,43 @@ def aggregate_splits(
 
     for sp, entry in splits:
         name = sp.safe_name
+        status = entry.get("status", "unknown")
+        is_done = _split_is_valid(entry)
         overview_text = ""
-        if entry.get("overview") and os.path.exists(entry["overview"]):
+        if is_done and entry.get("overview") and os.path.exists(entry["overview"]):
             try:
                 with open(entry["overview"], "r", encoding="utf-8") as f:
                     overview_text = f.read()
             except OSError:
                 overview_text = ""
-        aggregate_tree[name] = {
-            "components": [],
-            "children": {},
-            "relpath": sp.relpath,
-            "module_count": entry.get("module_count", 0),
-            "status": entry.get("status", "done"),
-            "overview": name + ".md",
-        }
-        child_docs[name] = {
-            "docs": overview_text,
-            "relpath": sp.relpath,
-            "module_count": entry.get("module_count", 0),
-        }
+
+        # Only completed splits contribute to the top-level architecture tree
+        # and the LLM overview (they're the ones with real docs to summarize).
+        if is_done:
+            aggregate_tree[name] = {
+                "components": [],
+                "children": {},
+                "relpath": sp.relpath,
+                "module_count": entry.get("module_count", 0),
+                "status": status,
+                "overview": name + ".md",
+            }
+            child_docs[name] = {
+                "docs": overview_text,
+                "relpath": sp.relpath,
+                "module_count": entry.get("module_count", 0),
+            }
+
         index_entries.append({
             "name": name,
             "relpath": sp.relpath,
             "depth": sp.depth,
-            "status": entry.get("status", "done"),
+            "status": status,
             "module_count": entry.get("module_count", 0),
+            "file_count": entry.get("file_count", 0),
+            "total_bytes": entry.get("total_bytes", 0),
+            "skip_reason": entry.get("skip_reason", ""),
+            "error": entry.get("error", ""),
             "output_dir": entry.get("output_dir", ""),
             "overview": entry.get("overview", ""),
             "module_tree": entry.get("module_tree", ""),
@@ -368,22 +420,34 @@ def aggregate_splits(
 
     # ---- stats markdown (plain .format, no nested f-string quotes) ----
     lines = ["# " + root_name + " - split documentation index", "",
-             "| module | relpath | depth | modules | status | overview |",
-             "|---|---|---|---|---|---|"]
+             "| module | relpath | depth | modules | status | note | overview |",
+             "|---|---|---|---|---|---|---|"]
     for e in index_entries:
         ov = e.get("overview", "")
         link = os.path.relpath(ov, str(root_output)) if ov else ""
-        lines.append("| {name} | `{rel}` | {depth} | {mc} | {st} | [{link}]({link}) |".format(
+        note = e.get("skip_reason") or (e.get("error", "")[:80] if e.get("error") else "")
+        lines.append("| {name} | `{rel}` | {depth} | {mc} | {st} | {note} | [{link}]({link}) |".format(
             name=e["name"], rel=e["relpath"], depth=e["depth"],
-            mc=e["module_count"], st=e["status"], link=link))
+            mc=e["module_count"], st=e["status"],
+            note=note.replace("|", "/").replace("\n", " "), link=link))
     lines += ["", "## Per-split documentation", ""]
     for e in index_entries:
         ov = e.get("overview", "")
         link = os.path.relpath(ov, str(root_output)) if ov else ""
-        lines += ["### {name} (`{rel}`)".format(name=e["name"], rel=e["relpath"]), "",
-                  "- modules: {mc}".format(mc=e["module_count"]),
-                  "- status: {st}".format(st=e["status"]),
-                  "- overview: [{link}]({link})".format(link=link), ""]
+        lines += ["### {name} (`{rel}`) - {st}".format(
+            name=e["name"], rel=e["relpath"], st=e["status"]), ""]
+        if e.get("status") == "done":
+            lines += ["- modules: {mc}".format(mc=e["module_count"]),
+                      "- overview: [{link}]({link})".format(link=link), ""]
+        elif e.get("status") == "skipped":
+            lines += ["- skipped: {reason} ({fc} files, {tb} bytes)".format(
+                reason=e.get("skip_reason", ""), fc=e.get("file_count", 0),
+                tb=e.get("total_bytes", 0)), ""]
+        elif e.get("status") == "failed":
+            err = (e.get("error", "") or "")[-200:]
+            lines += ["- failed: {err}".format(err=err.replace("\n", " ")), ""]
+        else:
+            lines += ["", ]
     (root_output / "split_stats.md").write_text("\n".join(lines), encoding="utf-8")
 
     # ---- LLM architecture overview (best-effort) ----
@@ -442,8 +506,16 @@ def run_split(
     aggregate: bool = True,
     jobs: int = 1,
     timeout: Optional[int] = None,
+    min_files: int = 1,
+    min_bytes: int = 1024,
 ) -> int:
-    """Orchestrate a split run. Returns a process exit code."""
+    """Orchestrate a split run. Returns a process exit code.
+
+    *min_files* / *min_bytes* gate pre-assessment: a split point whose
+    supported code is empty or below these thresholds is recorded as
+    ``skipped`` (not run, not retried) instead of spawning a sub-run that
+    would just fail. Set both to 0 to disable.
+    """
     if split_depth < 1:
         logger.error("[Split] --split must be >= 1 (got %d)", split_depth)
         return 2
@@ -472,13 +544,43 @@ def run_split(
     state.load()
 
     todo: List[SplitPoint] = []
+    empty_skipped = 0
     for sp in points:
         entry = state.get(sp.relpath)
         if _split_is_valid(entry):
             logger.info("[Split] skip (done): %s", sp.relpath)
             continue
+        # Pre-assess: skip subdirs with no/too-small code. These would only
+        # fail inside the sub-run (validate_repository raises on empty dirs),
+        # so skipping up front avoids wasted subprocess + LLM cost and keeps
+        # split_state honest (skipped, not retried on resume).
+        should_run, reason, fc, tb = _assess_split(sp, min_files, min_bytes)
+        if not should_run:
+            logger.info(
+                "[Split] skip (empty/too-small): %s - %s (%d files, %d bytes)",
+                sp.relpath, reason, fc, tb,
+            )
+            state.set(sp.relpath, {
+                "status": "skipped",
+                "depth": sp.depth,
+                "output_dir": "",
+                "overview": "",
+                "module_tree": "",
+                "module_count": 0,
+                "skip_reason": reason,
+                "file_count": fc,
+                "total_bytes": tb,
+                "attempts": 0,
+                "last_run": time.time(),
+            })
+            empty_skipped += 1
+            continue
         todo.append(sp)
-    logger.info("[Split] %d to run, %d skipped", len(todo), len(points) - len(todo))
+    logger.info(
+        "[Split] %d to run, %d done-skipped, %d empty-skipped",
+        len(todo), len(points) - len(todo) - empty_skipped, empty_skipped,
+    )
+    state.save()
 
     def _execute(sp: SplitPoint) -> Tuple[SplitPoint, bool, str]:
         sp_output = output_dir / SPLITS_SUBDIR / sp.safe_name
@@ -534,17 +636,23 @@ def run_split(
 
     state.save()
 
-    done_splits: List[Tuple[SplitPoint, Dict[str, Any]]] = []
+    all_splits: List[Tuple[SplitPoint, Dict[str, Any]]] = []
+    done_count = 0
     for sp in points:
         entry = state.get(sp.relpath)
-        if _split_is_valid(entry):
-            done_splits.append((sp, entry))
-    if aggregate and done_splits:
+        if entry:
+            all_splits.append((sp, entry))
+            if _split_is_valid(entry):
+                done_count += 1
+    if aggregate and all_splits:
         root_name = split_root.name or "repository"
-        logger.info("[Split] aggregating %d done split(s) into %s", len(done_splits), output_dir)
-        aggregate_splits(output_dir, root_name, done_splits, user_opts, repo_path)
-    elif aggregate and not done_splits:
-        logger.warning("[Split] no completed splits; skipping aggregation")
+        logger.info(
+            "[Split] aggregating %d split(s) (%d done, %d empty-skipped) into %s",
+            len(all_splits), done_count, empty_skipped, output_dir,
+        )
+        aggregate_splits(output_dir, root_name, all_splits, user_opts, repo_path)
+    elif aggregate and not all_splits:
+        logger.warning("[Split] no split entries; skipping aggregation")
 
     if failures:
         logger.error(

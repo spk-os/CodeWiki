@@ -386,6 +386,22 @@ def _invalidate_affected_modules(
     help="Per-split subprocess timeout in seconds (default: no timeout).",
 )
 @click.option(
+    "--split-min-files",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Skip split points with fewer than this many supported code files "
+         "(0 disables the file-count gate). Avoids running empty subdirs.",
+)
+@click.option(
+    "--split-min-bytes",
+    type=int,
+    default=1024,
+    show_default=True,
+    help="Skip split points whose supported code totals fewer than this many "
+         "bytes (0 disables). Avoids running trivially small subdirs.",
+)
+@click.option(
     "--no-kb",
     is_flag=True,
     default=False,
@@ -434,6 +450,8 @@ def generate_command(
     split_no_aggregate: bool = False,
     split_jobs: int = 1,
     split_timeout: Optional[int] = None,
+    split_min_files: int = 1,
+    split_min_bytes: int = 1024,
     no_kb: bool = False,
     kb_dir: Optional[str] = None,
     kb_port: Optional[int] = None,
@@ -617,6 +635,8 @@ def generate_command(
                 aggregate=not split_no_aggregate,
                 jobs=split_jobs,
                 timeout=split_timeout,
+                min_files=split_min_files,
+                min_bytes=split_min_bytes,
             )
             # Top-level HTML viewer for split mode (--github-pages). The
             # aggregator already wrote module_tree.json at the root output;
