@@ -618,6 +618,30 @@ def generate_command(
                 jobs=split_jobs,
                 timeout=split_timeout,
             )
+            # Top-level HTML viewer for split mode (--github-pages). The
+            # aggregator already wrote module_tree.json at the root output;
+            # HTMLGenerator auto-loads it (metadata optional). Sub-runs don't
+            # build HTML themselves (--no-kb path), so this is the only place
+            # an index.html is produced in split mode.
+            if (
+                github_pages
+                and not split_no_aggregate
+                and (output_dir / "module_tree.json").exists()
+            ):
+                try:
+                    from codewiki.cli.html_generator import HTMLGenerator
+                    hg = HTMLGenerator()
+                    repo_info = hg.detect_repository_info(repo_path)
+                    hg.generate(
+                        output_path=output_dir / "index.html",
+                        title=repo_info.get("name") or repo_path.name,
+                        repository_url=repo_info.get("url"),
+                        github_pages_url=repo_info.get("github_pages_url"),
+                        docs_dir=output_dir,
+                    )
+                    logger.success(f"Generated top-level index.html at {output_dir}")
+                except Exception as e:
+                    logger.warning(f"Top-level HTML generation failed: {e}")
             sys.exit(rc if rc is not None else 0)
 
         # Initialize checkpoint manager (best-effort: backend module may not yet
