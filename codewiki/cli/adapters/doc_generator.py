@@ -40,10 +40,11 @@ class CLIDocumentationGenerator:
         verbose: bool = False,
         generate_html: bool = False,
         commit_id: str = None,
+        quiet: bool = False,
     ):
         """
         Initialize the CLI documentation generator.
-        
+
         Args:
             repo_path: Repository path
             output_dir: Output directory
@@ -51,11 +52,13 @@ class CLIDocumentationGenerator:
             verbose: Enable verbose output
             generate_html: Whether to generate HTML viewer
             commit_id: Git commit SHA for incremental update tracking
+            quiet: Suppress INFO logs (only WARNING+ on console); verbose wins
         """
         self.repo_path = repo_path
         self.output_dir = output_dir
         self.config = config
         self.verbose = verbose
+        self.quiet = quiet
         self.generate_html = generate_html
         self.commit_id = commit_id
         self.progress_tracker = ProgressTracker(total_stages=5, verbose=verbose)
@@ -130,8 +133,15 @@ class CLIDocumentationGenerator:
         # Remove existing handlers to avoid duplicates
         backend_logger.handlers.clear()
         
-        # Determine effective log levels
-        console_level = logging.INFO if self.verbose else logging.WARNING
+        # Determine effective log levels.
+        # Default: INFO on console so codewiki's own logs print out of the box.
+        # verbose → DEBUG; quiet → WARNING (verbose takes precedence).
+        if self.verbose:
+            console_level = logging.DEBUG
+        elif self.quiet:
+            console_level = logging.WARNING
+        else:
+            console_level = logging.INFO
         
         # Create console handler with formatting
         console_handler = logging.StreamHandler(sys.stdout if self.verbose else sys.stderr)
@@ -244,7 +254,7 @@ class CLIDocumentationGenerator:
             self.progress_tracker.update_stage(0.2, "Initializing dependency analyzer...")
         
         # Create documentation generator
-        doc_generator = DocumentationGenerator(backend_config, commit_id=self.commit_id, ckpt=self.checkpoint)
+        doc_generator = DocumentationGenerator(backend_config, commit_id=self.commit_id, ckpt=self.checkpoint, key_pool=self.key_pool)
         
         # Checkpoint: resume from completed analysis phase
         components = None

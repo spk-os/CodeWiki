@@ -56,12 +56,14 @@ class DocumentationGenerator:
         commit_id: str = None,
         backend: LLMBackend = None,
         ckpt: CheckpointManager = None,
+        key_pool=None,
     ):
         self.config = config
         self.commit_id = commit_id
         self.graph_builder = DependencyGraphBuilder(config)
         self.ckpt = ckpt
-        self.backend: LLMBackend = backend or get_backend(config)
+        self.key_pool = key_pool
+        self.backend: LLMBackend = backend or get_backend(config, key_pool=key_pool)
     
     def create_documentation_metadata(self, working_dir: str, components: Dict[str, Any], num_leaf_nodes: int):
         """Create a metadata file with documentation generation information."""
@@ -233,14 +235,20 @@ class DocumentationGenerator:
 
             if leaf_modules:
                 concurrency = self.config.effective_concurrency
-                semaphore = asyncio.Semaphore(concurrency)
+                use_pool = self.key_pool is not None
+                # When a key pool is configured, its own semaphore enforces the
+                # global concurrency limit AND round-robins keys across agents.
+                # Otherwise fall back to a plain local semaphore (single key).
+                if not use_pool:
+                    semaphore = asyncio.Semaphore(concurrency)
                 logger.info(
                     f"📄 Processing {len(leaf_modules)} leaf modules "
                     f"with concurrency={concurrency}"
+                    + (f" across {self.key_pool.size} keys" if use_pool else "")
                 )
 
                 async def process_leaf(mp, mn, mk):
-                    async with semaphore:
+                    async def _run(api_key):
                         try:
                             mt = file_manager.load_json(module_tree_path)
                             mi = mt
@@ -260,6 +268,7 @@ class DocumentationGenerator:
                                 module_path=mp,
                                 working_dir=working_dir,
                                 tree_lock=tree_lock,
+                                api_key=api_key,
                             )
 
                             expected_md = os.path.join(working_dir, f"{mn}.md")
@@ -276,6 +285,13 @@ class DocumentationGenerator:
                             logger.error(f"Traceback: {traceback.format_exc()}")
                             if self.ckpt is not None:
                                 self.ckpt.mark_failed(mk, str(e))
+
+                    if use_pool:
+                        async with self.key_pool.acquire() as api_key:
+                            await _run(api_key)
+                    else:
+                        async with semaphore:
+                            await _run(None)
 
                 await asyncio.gather(
                     *[process_leaf(mp, mn, mk) for mp, mn, mk in leaf_modules]

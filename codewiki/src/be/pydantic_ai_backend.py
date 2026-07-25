@@ -42,11 +42,35 @@ logger = logging.getLogger(__name__)
 class PydanticAIBackend(LLMBackend):
     """API-key based backend using pydantic-ai + openai/litellm clients."""
 
-    def __init__(self, config: Config, ckpt: CheckpointManager | None = None) -> None:
+    def __init__(self, config: Config, ckpt: CheckpointManager | None = None, key_pool=None) -> None:
         self._config = config
         self._fallback_models = create_fallback_models(config)
         self._custom_instructions = config.get_prompt_addition()
         self._ckpt = ckpt
+        # Multi-key concurrency: when a key pool is configured, each concurrent
+        # module agent acquires a key from the pool and uses a per-key model
+        # (built lazily and cached).  Quality is unchanged — same models, same
+        # prompts, same temperature; only the API key varies per call.
+        self._key_pool = key_pool
+        self._models_by_key: Dict[str, Any] = {}
+        self._models_lock = threading.Lock()
+
+    def _models_for_key(self, api_key: Optional[str]):
+        """Return the FallbackModel to use for *api_key*.
+
+        Builds and caches one ``FallbackModel`` per distinct key (each gets its
+        own OpenAIProvider / httpx client) so concurrent agents on different
+        keys truly fire in parallel.  Falls back to the shared single-key
+        model when no key override is given.
+        """
+        if not api_key or self._key_pool is None:
+            return self._fallback_models
+        with self._models_lock:
+            models = self._models_by_key.get(api_key)
+            if models is None:
+                models = create_fallback_models(self._config, api_key=api_key)
+                self._models_by_key[api_key] = models
+            return models
 
     def complete(
         self,
@@ -54,6 +78,7 @@ class PydanticAIBackend(LLMBackend):
         *,
         model: str | None = None,
         temperature: float = 0.0,
+        api_key: Optional[str] = None,
     ) -> str:
         effective_model = model or self._config.main_model
         if self._ckpt is not None:
@@ -62,7 +87,9 @@ class PydanticAIBackend(LLMBackend):
                 logger.info("[Resume] LLM cache hit for model=%s", effective_model)
                 return cached
 
-        response = call_llm(prompt, self._config, model=model, temperature=temperature)
+        response = call_llm(
+            prompt, self._config, model=model, temperature=temperature, api_key=api_key
+        )
 
         if self._ckpt is not None and response:
             self._ckpt.save_llm_cache(prompt, effective_model, response)
@@ -76,6 +103,7 @@ class PydanticAIBackend(LLMBackend):
         module_path: List[str],
         working_dir: str,
         tree_lock: Optional[threading.RLock] = None,
+        api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = self._config
         self._tree_lock = tree_lock
@@ -100,9 +128,12 @@ class PydanticAIBackend(LLMBackend):
             config.analysis_mode != "coarse"
             and is_complex_module(components, core_component_ids)
         )
+        # Pick the model set for this call's API key (per-key pool when
+        # configured, else the shared single-key fallback models).
+        models = self._models_for_key(api_key)
         if use_delegation:
             agent = Agent(
-                self._fallback_models,
+                models,
                 name=module_name,
                 deps_type=CodeWikiDeps,
                 tools=[
@@ -115,7 +146,7 @@ class PydanticAIBackend(LLMBackend):
             )
         else:
             agent = Agent(
-                self._fallback_models,
+                models,
                 name=module_name,
                 deps_type=CodeWikiDeps,
                 tools=[read_code_components_tool, str_replace_editor_tool],

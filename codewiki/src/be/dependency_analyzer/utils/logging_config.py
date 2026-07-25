@@ -37,6 +37,10 @@ LOG_DIR = "/usr/log/codewiki"
 LOG_FILE_NAME = "codewiki.log"
 FILE_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(filename)s:%(funcName)s:%(lineno)d - %(message)s"
 
+# Local fallback log location used when the privileged LOG_DIR is not writable.
+# Honored in this order: CODEWIKI_LOG_FILE env var > ./codewiki.log (cwd).
+LOCAL_LOG_FILE_NAME = "codewiki.log"
+
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colored output for better readability.
@@ -122,19 +126,66 @@ def setup_logging(level=logging.INFO):
 
 
 def _build_file_handler():
-    """Create a file handler under LOG_DIR. Returns None if filesystem unavailable."""
+    """Create a file handler for persistent logging.
+
+    Tries the privileged LOG_DIR first; on any failure (no root perms,
+    read-only fs, etc.) falls back to a local codewiki.log so logs are never
+    silently lost. Returns None only if even the local file cannot be created.
+    """
+    def _make(path: str):
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(FILE_LOG_FORMAT))
+        return handler
+
+    # 1. Privileged central log dir.
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        log_path = os.path.join(LOG_DIR, LOG_FILE_NAME)
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(FILE_LOG_FORMAT))
-        return file_handler
+        return _make(os.path.join(LOG_DIR, LOG_FILE_NAME))
+    except (OSError, PermissionError):
+        pass
+
+    # 2. Env override / local fallback.
+    local_path = os.environ.get("CODEWIKI_LOG_FILE") or os.path.join(
+        os.getcwd(), LOCAL_LOG_FILE_NAME
+    )
+    try:
+        local_dir = os.path.dirname(os.path.abspath(local_path))
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
+        return _make(local_path)
     except (OSError, PermissionError) as e:
         sys.stderr.write(
-            f"[logging_config] Could not create file handler at {LOG_DIR}: {e}\n"
+            f"[logging_config] Could not create file handler at {local_path}: {e}\n"
         )
         return None
+
+
+def setup_cli_logging(level=logging.INFO):
+    """Configure the ``codewiki`` package logger so its own logs print by default.
+
+    This attaches a colored console handler to the ``codewiki`` logger only —
+    the root logger is left untouched, so third-party libraries (httpx, openai,
+    pydantic_ai, ...) stay quiet.  Covers ``codewiki.cli.*``; the backend
+    ``codewiki.src.be`` logger keeps its own (richer) configuration but, when
+    that hasn't been set up yet, propagates up to this handler as a fallback.
+
+    Idempotent: re-calling (e.g. after --verbose/--quiet) replaces the prior
+    CLI handler without duplicating output.
+    """
+    pkg_logger = logging.getLogger("codewiki")
+    pkg_logger.setLevel(level)
+    # Drop only our own previously-attached CLI handler.
+    pkg_logger.handlers = [
+        h for h in pkg_logger.handlers if not getattr(h, "_codewiki_cli", False)
+    ]
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    handler.setFormatter(ColoredFormatter())
+    handler._codewiki_cli = True
+    pkg_logger.addHandler(handler)
+    pkg_logger.propagate = False
+    return pkg_logger
 
 
 def setup_module_logging(module_name: str, level=logging.INFO):

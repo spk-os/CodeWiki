@@ -7,6 +7,7 @@ import click
 from pathlib import Path
 
 from codewiki import __version__
+from codewiki.src.be.dependency_analyzer.utils.logging_config import setup_cli_logging
 
 
 @click.group()
@@ -21,6 +22,9 @@ def cli(ctx):
     """
     # Ensure context object exists
     ctx.ensure_object(dict)
+    # Make codewiki's own logs print by default (INFO on stderr). Subcommands
+    # may re-run setup_cli_logging() with DEBUG (--verbose) or WARNING (--quiet).
+    setup_cli_logging()
 
 
 @cli.command()

@@ -273,6 +273,12 @@ def _invalidate_affected_modules(
     help="Show detailed progress and debug information",
 )
 @click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress INFO logs (show only WARNING+); overrides default INFO logging. -v wins over -q.",
+)
+@click.option(
     "--max-tokens",
     type=int,
     default=None,
@@ -338,6 +344,48 @@ def _invalidate_affected_modules(
     help="Analysis mode: coarse (fast, no sub-agent delegation), fine (deep, max_depth>=3), standard (default)",
 )
 @click.option(
+    "--split",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Split a very large repo into per-subdirectory runs: 0=off, N=split at "
+         "depth N (from --split-root, default cwd). Each split point gets its own "
+         "scoped `codewiki generate`; results are aggregated into a top-level index + overview.",
+)
+@click.option(
+    "--split-override",
+    "split_overrides",
+    multiple=True,
+    metavar="PATH=DEPTH",
+    help="Per-subtree depth override, repeatable (e.g. root/opencode=3). The "
+         "subtree is split at the given depth instead of the global --split value.",
+)
+@click.option(
+    "--split-root",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help="Root directory for split depth measurement (default: current working dir).",
+)
+@click.option(
+    "--split-no-aggregate",
+    is_flag=True,
+    default=False,
+    help="Run each split point but skip building the top-level index/overview.",
+)
+@click.option(
+    "--split-jobs",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Run this many split points in parallel (default 1 = serial).",
+)
+@click.option(
+    "--split-timeout",
+    type=int,
+    default=None,
+    help="Per-split subprocess timeout in seconds (default: no timeout).",
+)
+@click.option(
     "--no-kb",
     is_flag=True,
     default=False,
@@ -368,6 +416,7 @@ def generate_command(
     doc_type: Optional[str],
     instructions: Optional[str],
     verbose: bool,
+    quiet: bool,
     max_tokens: Optional[int],
     max_token_per_module: Optional[int],
     max_token_per_leaf_module: Optional[int],
@@ -379,6 +428,12 @@ def generate_command(
     cache_dir: Optional[str] = None,
     concurrency: Optional[int] = None,
     mode: Optional[str] = None,
+    split: int = 0,
+    split_overrides: Tuple[str, ...] = (),
+    split_root: Optional[str] = None,
+    split_no_aggregate: bool = False,
+    split_jobs: int = 1,
+    split_timeout: Optional[int] = None,
     no_kb: bool = False,
     kb_dir: Optional[str] = None,
     kb_port: Optional[int] = None,
@@ -427,8 +482,16 @@ def generate_command(
     # Override max depth for hierarchical decomposition
     $ codewiki generate --max-depth 3
     """
-    logger = create_logger(verbose=verbose)
+    logger = create_logger(verbose=verbose, quiet=quiet)
     start_time = time.time()
+
+    # Adjust package log level to match -v / -q (group default is INFO).
+    import logging as _logging
+    from codewiki.src.be.dependency_analyzer.utils.logging_config import setup_cli_logging
+    if verbose:
+        setup_cli_logging(_logging.DEBUG)
+    elif quiet:
+        setup_cli_logging(_logging.WARNING)
 
     if instructions:
         instructions = instructions.encode('utf-8', errors='replace').decode('utf-8')
@@ -499,6 +562,63 @@ def generate_command(
         check_writable_output(output_dir.parent)
         
         logger.success(f"Output directory: {output_dir}")
+
+        # ----- Split mode: delegate to the split orchestrator -----
+        # A --split > 0 run never executes the normal single-pass pipeline here;
+        # instead it spawns one scoped `codewiki generate` per subdirectory and
+        # aggregates the results. Failed splits are retried on re-run.
+        if split and split > 0:
+            from codewiki.cli.split_orchestrator import run_split, parse_overrides
+            overrides = parse_overrides(list(split_overrides))
+            split_root_path = (
+                Path(split_root).expanduser().resolve() if split_root else repo_path
+            )
+            eff_cache = cache_dir or config.cache_dir
+            agg_config = {
+                'main_model': config.main_model,
+                'cluster_model': config.cluster_model,
+                'fallback_model': config.fallback_model,
+                'base_url': config.base_url,
+                'api_key': effective_api_key,
+                'provider': getattr(config, 'provider', 'openai-compatible'),
+                'aws_region': getattr(config, 'aws_region', 'us-east-1'),
+                'agent_instructions': None,
+                'max_tokens': max_tokens if max_tokens is not None else config.max_tokens,
+                'max_token_per_module': max_token_per_module if max_token_per_module is not None else config.max_token_per_module,
+                'max_token_per_leaf_module': max_token_per_leaf_module if max_token_per_leaf_module is not None else config.max_token_per_leaf_module,
+                'max_depth': max_depth if max_depth is not None else config.max_depth,
+                'disable_proxy': config.disable_proxy,
+                'api_keys': config.api_keys,
+                'concurrency': concurrency if concurrency is not None else config.effective_concurrency,
+                'model_context_window': config.model_context_window,
+                'llm_timeout': config.llm_timeout,
+                'llm_max_retries': config.llm_max_retries,
+                'llm_retry_interval': config.llm_retry_interval,
+                'analysis_mode': mode or 'standard',
+                'cache_dir': eff_cache,
+                'resume': resume,
+            }
+            user_opts = {
+                'include': include, 'exclude': exclude, 'focus': focus,
+                'doc_type': doc_type, 'instructions': instructions,
+                'concurrency': concurrency, 'mode': mode,
+                'max_tokens': max_tokens, 'max_token_per_module': max_token_per_module,
+                'max_token_per_leaf_module': max_token_per_leaf_module,
+                'max_depth': max_depth, 'verbose': verbose, 'quiet': quiet,
+            }
+            rc = run_split(
+                repo_path=repo_path,
+                output_dir=output_dir,
+                cache_dir=Path(eff_cache),
+                split_depth=split,
+                split_root=split_root_path,
+                overrides=overrides,
+                user_opts=user_opts,
+                aggregate=not split_no_aggregate,
+                jobs=split_jobs,
+                timeout=split_timeout,
+            )
+            sys.exit(rc if rc is not None else 0)
 
         # Initialize checkpoint manager (best-effort: backend module may not yet
         # be available in older installs — degrade gracefully).
@@ -674,6 +794,7 @@ def generate_command(
             verbose=verbose,
             generate_html=github_pages,
             commit_id=commit_id,
+            quiet=quiet,
         )
         
         # Run generation

@@ -10,14 +10,17 @@ import click
 class CLILogger:
     """Logger for CLI with support for colored output and progress tracking."""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, quiet: bool = False):
         """
         Initialize the logger.
 
         Args:
             verbose: Enable verbose output
+            quiet: Suppress non-essential output (info/step/success); warnings and
+                errors still show. verbose takes precedence over quiet.
         """
         self.verbose = verbose
+        self.quiet = quiet and not verbose
         self.start_time = datetime.now()
 
     @staticmethod
@@ -33,11 +36,13 @@ class CLILogger:
 
     def info(self, message: str):
         """Log info message."""
-        click.echo(self._safe(message))
+        if not self.quiet:
+            click.echo(self._safe(message))
 
     def success(self, message: str):
         """Log success message in green."""
-        click.secho(self._safe(f"✓ {message}"), fg="green")
+        if not self.quiet:
+            click.secho(self._safe(f"✓ {message}"), fg="green")
 
     def warning(self, message: str):
         """Log warning message in yellow."""
@@ -61,7 +66,8 @@ class CLILogger:
         else:
             prefix = "→"
 
-        click.secho(self._safe(f"{prefix} {message}"), fg="blue", bold=True)
+        if not self.quiet:
+            click.secho(self._safe(f"{prefix} {message}"), fg="blue", bold=True)
     
     def elapsed_time(self) -> str:
         """Get elapsed time since logger was created."""
@@ -75,15 +81,16 @@ class CLILogger:
             return f"{seconds}s"
 
 
-def create_logger(verbose: bool = False) -> CLILogger:
+def create_logger(verbose: bool = False, quiet: bool = False) -> CLILogger:
     """
     Create and return a CLI logger.
-    
+
     Args:
         verbose: Enable verbose output
-        
+        quiet: Suppress non-essential output (verbose wins)
+
     Returns:
         Configured CLILogger instance
     """
-    return CLILogger(verbose=verbose)
+    return CLILogger(verbose=verbose, quiet=quiet)
 

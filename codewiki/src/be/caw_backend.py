@@ -247,6 +247,7 @@ class CawBackend(LLMBackend):
         *,
         model: str | None = None,
         temperature: float = 0.0,  # unused: subscription CLIs don't expose temperature
+        api_key: str | None = None,  # unused: subscription CLIs have no API key
     ) -> str:
         # Blocks the calling thread for the lifetime of the claude/codex
         # subprocess.  Callers running this from an async context (e.g. the
@@ -273,6 +274,7 @@ class CawBackend(LLMBackend):
         module_path: List[str],
         working_dir: str,
         tree_lock: Optional[threading.RLock] = None,
+        api_key: str | None = None,  # unused: subscription CLIs have no API key
     ) -> Dict[str, Any]:
         self._tree_lock = tree_lock
         set_main_loop(asyncio.get_running_loop())

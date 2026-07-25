@@ -64,11 +64,16 @@ class LLMBackend(abc.ABC):
         """
 
 
-def get_backend(config) -> "LLMBackend":
-    """Return the backend instance matching ``config.provider``."""
+def get_backend(config, key_pool=None) -> "LLMBackend":
+    """Return the backend instance matching ``config.provider``.
+
+    *key_pool* is forwarded to the API-key backend so concurrent module agents
+    can round-robin across multiple keys.  Ignored by the caw (subscription)
+    backend, which has no API key.
+    """
     provider = getattr(config, "provider", "openai-compatible")
     if is_caw_provider(provider):
         from codewiki.src.be.caw_backend import CawBackend
         return CawBackend(config)
     from codewiki.src.be.pydantic_ai_backend import PydanticAIBackend
-    return PydanticAIBackend(config)
+    return PydanticAIBackend(config, key_pool=key_pool)
