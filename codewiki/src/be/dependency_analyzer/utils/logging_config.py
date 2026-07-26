@@ -33,7 +33,7 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 
-LOG_DIR = "/root/share/logs/codewiki"
+LOG_DIR = "/root/share/logs/knowledge/codewiki"
 LOG_FILE_NAME = "codewiki.log"
 FILE_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(filename)s:%(funcName)s:%(lineno)d - %(message)s"
 
