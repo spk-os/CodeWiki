@@ -357,8 +357,10 @@ def _invalidate_affected_modules(
     "split_overrides",
     multiple=True,
     metavar="PATH=DEPTH",
-    help="Per-subtree depth override, repeatable (e.g. root/opencode=3). The "
-         "subtree is split at the given depth instead of the global --split value.",
+    help="Per-subtree depth override, repeatable (e.g. temp=3). The override "
+         "propagates down the whole subtree (until a deeper path supersedes "
+         "it), so one override splits a subtree at the given depth without "
+         "needing to override each intermediate directory.",
 )
 @click.option(
     "--split-root",

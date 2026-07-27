@@ -14,7 +14,9 @@ Layered split semantics (depth measured from ``--split-root``, default cwd):
 discovers subdirectories at depth 2 (``root/soft``, ``root/hermes``) and runs
 a scoped ``codewiki generate`` in each; the override raises ``root/opencode``
 to depth 3 so its children (``root/opencode/soft``, ``root/opencode/test``)
-become the split points instead.
+become the split points instead. An override propagates down the whole
+subtree, so overriding ``root/opencode`` alone is enough — there is no need
+to also override each intermediate directory beneath it.
 
 Resume: each split point's status (done/failed) is persisted to
 ``<cache_dir>/split_state.json``.  Re-running the same command skips ``done``
@@ -158,26 +160,41 @@ def find_split_points(
     """Walk *root* depth-first; a directory at its configured depth is a split point.
 
     depth is measured from *root* (root itself = 0).  cfg_depth for a directory
-    is ``overrides.get(relpath, global_depth)``.  When ``depth >= cfg_depth``
-    the directory is a split point and is NOT descended further; otherwise we
-    recurse into its subdirectories.
+    is its own override if listed in *overrides*, else the depth inherited from
+    the nearest overridden ancestor, else *global_depth*.  When
+    ``depth >= cfg_depth`` the directory is a split point and is NOT descended
+    further; otherwise we recurse into its subdirectories.
+
+    An override propagates down the whole subtree: ``--split-override a=3``
+    makes ``a`` and every directory beneath it resolve to depth 3, until a
+    more specific override (a deeper path) supersedes it. So a single override
+    is enough to split an entire subtree at a deeper level — there is no need
+    to also override each intermediate directory.
     """
     root = root.resolve()
     results: List[SplitPoint] = []
 
-    def walk(dir_path: Path, depth: int) -> None:
+    def walk(dir_path: Path, depth: int, inherited: Optional[int]) -> None:
         if dir_path == root:
             relkey = ""
         else:
             relkey = dir_path.as_posix().replace(root.as_posix() + "/", "")
-        cfg_depth = overrides.get(relkey, global_depth)
+        if relkey in overrides:
+            cfg_depth = overrides[relkey]
+            child_inherited = cfg_depth
+        elif inherited is not None:
+            cfg_depth = inherited
+            child_inherited = inherited
+        else:
+            cfg_depth = global_depth
+            child_inherited = None
         if depth >= cfg_depth:
             results.append(SplitPoint(dir_path, relkey or ".", depth))
             return
         for child in _subdirs(dir_path):
-            walk(child, depth + 1)
+            walk(child, depth + 1, child_inherited)
 
-    walk(root, 0)
+    walk(root, 0, None)
     return results
 
 
