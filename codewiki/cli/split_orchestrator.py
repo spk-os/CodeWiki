@@ -604,7 +604,12 @@ def aggregate_splits(
         # {custom_instructions} placeholders (same convention as
         # SYSTEM_PROMPT). Fill them from agent instructions so .format()
         # does not KeyError. Mirrors prompt_template.format_system_prompt.
-        raw_ci = config.get("agent_instructions")
+        # user_opts carries the raw --instructions string under "instructions";
+        # non-split paths use an "agent_instructions" dict. Accept both so the
+        # top-level overview honors --instructions (e.g. "write in Chinese").
+        raw_ci = config.get("instructions")
+        if not raw_ci:
+            raw_ci = config.get("agent_instructions")
         if isinstance(raw_ci, dict):
             raw_ci = raw_ci.get("custom_instructions")
         raw_ci = raw_ci or ""
