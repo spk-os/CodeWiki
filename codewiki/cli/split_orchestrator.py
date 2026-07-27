@@ -155,7 +155,8 @@ def _assess_split(
 
 
 def find_split_points(
-    root: Path, global_depth: int, overrides: Dict[str, int]
+    root: Path, global_depth: int, overrides: Dict[str, int],
+    exclude_paths: Optional[List[Path]] = None,
 ) -> List[SplitPoint]:
     """Walk *root* depth-first; a directory at its configured depth is a split point.
 
@@ -170,11 +171,18 @@ def find_split_points(
     more specific override (a deeper path) supersedes it. So a single override
     is enough to split an entire subtree at a deeper level — there is no need
     to also override each intermediate directory.
+
+    *exclude_paths* are directories (e.g. the ``--output`` dir) that must
+    never become split points or be descended into — typically used to avoid
+    self-reference when the output dir lives inside the split root.
     """
     root = root.resolve()
+    exclude = {Path(p).resolve() for p in (exclude_paths or [])}
     results: List[SplitPoint] = []
 
     def walk(dir_path: Path, depth: int, inherited: Optional[int]) -> None:
+        if dir_path.resolve() in exclude:
+            return
         if dir_path == root:
             relkey = ""
         else:
@@ -304,6 +312,8 @@ def _run_one_split(
                 cwd=str(sp.abs_path),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
                 text=True,
                 timeout=timeout,
             )
@@ -677,7 +687,9 @@ def run_split(
     output_dir = output_dir.resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    points = find_split_points(split_root, split_depth, overrides)
+    points = find_split_points(
+        split_root, split_depth, overrides, exclude_paths=[output_dir],
+    )
     logger.info(
         "[Split] root=%s depth=%d overrides=%s -> %d split point(s)",
         split_root, split_depth, overrides, len(points),
