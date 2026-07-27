@@ -325,38 +325,68 @@ def _run_one_split(
 # ---------------------------------------------------------------------------
 
 def _make_backend(config: Dict[str, Any], repo_path: Path):
-    """Build a backend for the top-level aggregation LLM call."""
-    from codewiki.src.config import Config as BackendConfig, set_cli_context
+    """Build a backend for the top-level aggregation LLM call.
+
+    Reloads the full CLI config via :class:`ConfigManager` (keyring-decrypted
+    keys + provider/base_url) the same way sub-runs and non-split mode do,
+    so the aggregation call authenticates identically. The previous path
+    built a BackendConfig from the partial agg_config dict and the OpenAI
+    client raised "Missing credentials". Falls back to from_cli if the
+    ConfigManager is unavailable.
+    """
     from codewiki.src.be.backend import get_backend
+    from codewiki.src.config import set_cli_context
     set_cli_context(True)
-    raw_key = config.get("api_key", "") or ""
-    first_key = raw_key.split(",")[0].strip() if raw_key else ""
-    backend_config = BackendConfig.from_cli(
-        repo_path=str(repo_path),
-        output_dir=str(repo_path),
-        llm_base_url=config.get("base_url"),
-        llm_api_key=first_key,
-        main_model=config.get("main_model"),
-        cluster_model=config.get("cluster_model"),
-        fallback_model=config.get("fallback_model"),
-        provider=config.get("provider", "openai-compatible"),
-        aws_region=config.get("aws_region", "us-east-1"),
-        max_tokens=config.get("max_tokens", 32768),
-        max_token_per_module=config.get("max_token_per_module", 36369),
-        max_token_per_leaf_module=config.get("max_token_per_leaf_module", 16000),
-        max_depth=config.get("max_depth", 2),
-        agent_instructions=config.get("agent_instructions"),
-        api_keys=config.get("api_keys", ""),
-        concurrency=config.get("concurrency", 0),
-        disable_proxy=config.get("disable_proxy", True),
-        cache_dir=config.get("cache_dir", ".codewiki_cache"),
-        resume=config.get("resume", True),
-        model_context_window=config.get("model_context_window", 0),
-        llm_timeout=config.get("llm_timeout", 1200),
-        llm_max_retries=config.get("llm_max_retries", 10),
-        llm_retry_interval=config.get("llm_retry_interval", 60),
-        analysis_mode=config.get("analysis_mode", "standard"),
-    )
+
+    backend_config = None
+    try:
+        from codewiki.cli.config_manager import ConfigManager
+        cm = ConfigManager()
+        if cm.load():
+            cli_config = cm.get_config()
+            raw_key = cm.get_api_key() or ""
+            first_key = raw_key.split(",")[0].strip() if raw_key else ""
+            if cli_config is not None:
+                backend_config = cli_config.to_backend_config(
+                    repo_path=str(repo_path),
+                    output_dir=str(repo_path),
+                    api_key=first_key,
+                )
+    except Exception as e:
+        logger.warning(
+            "[Split] ConfigManager reload failed (%s); falling back to agg_config", e,
+        )
+
+    if backend_config is None:
+        from codewiki.src.config import Config as BackendConfig
+        raw_key = config.get("api_key", "") or ""
+        first_key = raw_key.split(",")[0].strip() if raw_key else ""
+        backend_config = BackendConfig.from_cli(
+            repo_path=str(repo_path),
+            output_dir=str(repo_path),
+            llm_base_url=config.get("base_url"),
+            llm_api_key=first_key,
+            main_model=config.get("main_model"),
+            cluster_model=config.get("cluster_model"),
+            fallback_model=config.get("fallback_model"),
+            provider=config.get("provider", "openai-compatible"),
+            aws_region=config.get("aws_region", "us-east-1"),
+            max_tokens=config.get("max_tokens", 32768),
+            max_token_per_module=config.get("max_token_per_module", 36369),
+            max_token_per_leaf_module=config.get("max_token_per_leaf_module", 16000),
+            max_depth=config.get("max_depth", 2),
+            agent_instructions=config.get("agent_instructions"),
+            api_keys=config.get("api_keys", ""),
+            concurrency=config.get("concurrency", 0),
+            disable_proxy=config.get("disable_proxy", True),
+            cache_dir=config.get("cache_dir", ".codewiki_cache"),
+            resume=config.get("resume", True),
+            model_context_window=config.get("model_context_window", 0),
+            llm_timeout=config.get("llm_timeout", 1200),
+            llm_max_retries=config.get("llm_max_retries", 10),
+            llm_retry_interval=config.get("llm_retry_interval", 60),
+            analysis_mode=config.get("analysis_mode", "standard"),
+        )
     return get_backend(backend_config)
 
 
@@ -560,9 +590,31 @@ def aggregate_splits(
     try:
         from codewiki.src.be.prompt_template import REPO_OVERVIEW_PROMPT
         backend = _make_backend(config, repo_path)
+        # REPO_OVERVIEW_PROMPT carries {priority_directive} and
+        # {custom_instructions} placeholders (same convention as
+        # SYSTEM_PROMPT). Fill them from agent instructions so .format()
+        # does not KeyError. Mirrors prompt_template.format_system_prompt.
+        raw_ci = config.get("agent_instructions")
+        if isinstance(raw_ci, dict):
+            raw_ci = raw_ci.get("custom_instructions")
+        raw_ci = raw_ci or ""
+        custom_section = ""
+        priority_directive = ""
+        if raw_ci:
+            custom_section = "\n\n<CUSTOM_INSTRUCTIONS>\n{}\n</CUSTOM_INSTRUCTIONS>".format(raw_ci)
+            priority_directive = (
+                "<PRIORITY_DIRECTIVE>\n"
+                "The following instructions OVERRIDE the default behavior of this prompt. "
+                "You MUST follow them strictly, even if they conflict with the language or "
+                "style of the surrounding prompt.\n"
+                "{}\n"
+                "</PRIORITY_DIRECTIVE>\n"
+            ).format(raw_ci)
         prompt = REPO_OVERVIEW_PROMPT.format(
             repo_name=root_name,
             repo_structure=json.dumps(child_docs, indent=4, ensure_ascii=False),
+            priority_directive=priority_directive,
+            custom_instructions=custom_section,
         )
         resp = backend.complete(prompt)
         if "<OVERVIEW>" in resp and "</OVERVIEW>" in resp:
