@@ -372,7 +372,7 @@ def format_user_prompt(
 
         core_component_codes += f"# File: {path}\n"
         core_component_codes += f"## Core Components in this file:\n{component_ids_str}\n"
-        core_component_codes += f"\n## File Content:\ ```{EXTENSION_TO_LANGUAGE['.'+path.split('.')[-1]]}\n"
+        core_component_codes += f"\n## File Content:\n```{EXTENSION_TO_LANGUAGE['.'+path.split('.')[-1]]}\n"
 
         try:
             file_content = file_manager.load_text(components[component_ids_in_file[0]].file_path)
@@ -397,7 +397,7 @@ def format_user_prompt(
                 current_content_tokens += content_tokens
 
         core_component_codes += file_content
-        core_component_codes += "\``\n\n"
+        core_component_codes += "```\n\n"
 
     if truncated_files:
         core_component_codes += f"# Note: {len(truncated_files)} files were truncated to fit within the {context_window}-token context window.\n"
