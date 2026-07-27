@@ -72,6 +72,16 @@ def _build_proxyless_httpx_client(timeout: int = DEFAULT_LLM_TIMEOUT) -> httpx.C
     return httpx.Client(trust_env=False, timeout=httpx.Timeout(float(timeout)))
 
 
+def _build_proxyless_async_httpx_client(timeout: int = DEFAULT_LLM_TIMEOUT) -> httpx.AsyncClient:
+    """Create an httpx.AsyncClient that ignores environment proxies.
+
+    Used for pydantic-ai OpenAIProvider (async clients), so sub-agent /
+    FallbackModel calls also connect directly instead of honoring
+    HTTP_PROXY / HTTPS_PROXY / ALL_PROXY.
+    """
+    return httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(float(timeout)))
+
+
 def _should_use_max_completion_tokens(model_name: str, base_url: str) -> bool:
     """
     Determine whether to use max_completion_tokens instead of max_tokens.
@@ -163,6 +173,9 @@ def create_main_model(config: Config, api_key: Optional[str] = None) -> Compatib
         provider=OpenAIProvider(
             base_url=config.llm_base_url,
             api_key=api_key or config.llm_api_key,
+            http_client=_build_proxyless_async_httpx_client(
+                getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+            ),
         ),
         settings=_build_model_settings(config, config.main_model)
     )
@@ -175,6 +188,9 @@ def create_fallback_model(config: Config, api_key: Optional[str] = None) -> Comp
         provider=OpenAIProvider(
             base_url=config.llm_base_url,
             api_key=api_key or config.llm_api_key,
+            http_client=_build_proxyless_async_httpx_client(
+                getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+            ),
         ),
         settings=_build_model_settings(config, config.fallback_model)
     )
