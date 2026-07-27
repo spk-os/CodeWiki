@@ -89,7 +89,8 @@ class HTMLGenerator:
         github_pages_url: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         docs_dir: Optional[Path] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        lang: str = "en"
     ):
         """
         Generate HTML documentation viewer.
@@ -160,6 +161,7 @@ class HTMLGenerator:
             "{{MODULE_TREE_JSON}}": module_tree_json,
             "{{METADATA_JSON}}": metadata_json,
             "{{DOCS_BASE_PATH}}": docs_base_path,
+            "{{LANG}}": lang,
         }
         
         for placeholder, value in replacements.items():

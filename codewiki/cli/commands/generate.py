@@ -209,6 +209,13 @@ def _invalidate_affected_modules(
         logger.debug(f"Invalidated {len(modules_to_invalidate)} modules for regeneration.")
 
 
+def _viewer_lang(instructions: Optional[str]) -> str:
+    """Pick the viewer UI language from --instructions (zh if CJK present)."""
+    if instructions and any('一' <= ch <= '鿿' for ch in instructions):
+        return 'zh'
+    return 'en'
+
+
 @click.command(name="generate")
 @click.option(
     "--output",
@@ -660,6 +667,7 @@ def generate_command(
                         repository_url=repo_info.get("url"),
                         github_pages_url=repo_info.get("github_pages_url"),
                         docs_dir=output_dir,
+                        lang=_viewer_lang(instructions),
                     )
                     logger.success(f"Generated top-level index.html at {output_dir}")
                 except Exception as e:

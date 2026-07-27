@@ -373,12 +373,12 @@
             <div class="logo">📚 {{TITLE}}</div>
             
             <div class="repo-info" id="repo-info" style="display: {{SHOW_INFO}};">
-                <h4>Generation Info</h4>
+                <h4 id="ui-geninfo">Generation Info</h4>
                 <div id="info-content">{{INFO_CONTENT}}</div>
             </div>
             
             <div class="nav-section">
-                <div class="nav-item active" data-file="overview.md">
+                <div class="nav-item active" data-file="overview.md" id="ui-overview">
                     📄 Overview
                 </div>
             </div>
@@ -389,7 +389,7 @@
         <main class="content">
             <div id="loading" class="loading">
                 <div class="loading-spinner"></div>
-                <p>Loading documentation...</p>
+                <p id="ui-loading">Loading documentation...</p>
             </div>
             
             <div id="content" class="markdown-content" style="display: none;"></div>
@@ -402,6 +402,20 @@
         const MODULE_TREE = {{MODULE_TREE_JSON}};
         const METADATA = {{METADATA_JSON}};
         const DOCS_BASE_PATH = '{{DOCS_BASE_PATH}}';
+        // UI language: injected by HTMLGenerator from --instructions (zh if
+        // the instructions contain CJK chars, else en). Fallback to 'en' when
+        // the placeholder was not replaced (e.g. older generator).
+        const LANG = ('{{LANG}}' && '{{LANG}}'.indexOf('{') !== 0) ? '{{LANG}}' : 'en';
+        const I18N = {
+            en: { genInfo: 'Generation Info', overview: 'Overview', loading: 'Loading documentation...', error: '⚠️ Error', mermaidError: 'Error rendering diagram:\n' },
+            zh: { genInfo: '生成信息', overview: '概览', loading: '正在加载文档...', error: '⚠️ 错误', mermaidError: '图表渲染错误：\n' },
+        };
+        const T = I18N[LANG] || I18N.en;
+        function applyI18n() {
+            const el = document.getElementById('ui-geninfo'); if (el) el.textContent = T.genInfo;
+            const ov = document.getElementById('ui-overview'); if (ov) ov.innerHTML = '📄 ' + T.overview;
+            const ld = document.getElementById('ui-loading'); if (ld) ld.textContent = T.loading;
+        }
         
         // Initialize marked with options
         marked.setOptions({
@@ -429,10 +443,11 @@
         
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
+            applyI18n();
             if (MODULE_TREE) {
                 buildNavigation();
             }
-            
+
             // Load overview by default
             loadDocument('overview.md');
         });
@@ -619,7 +634,7 @@
                     element.innerHTML = svg;
                 } catch (error) {
                     console.error('Mermaid rendering error:', error);
-                    element.innerHTML = `<pre>Error rendering diagram:\n${element.textContent}</pre>`;
+                    element.innerHTML = `<pre>${T.mermaidError}${element.textContent}</pre>`;
                 }
             }
         }
@@ -632,7 +647,7 @@
             content.style.display = 'block';
             content.innerHTML = `
                 <div class="error">
-                    <h3>⚠️ Error</h3>
+                    <h3>${T.error}</h3>
                     <p>${message}</p>
                 </div>
             `;
