@@ -360,6 +360,86 @@ def _make_backend(config: Dict[str, Any], repo_path: Path):
     return get_backend(backend_config)
 
 
+def _build_nested_tree(
+    done_splits: List[Tuple[SplitPoint, Dict[str, Any]]],
+    root_output: Path,
+) -> Dict[str, Any]:
+    """Build a nested module_tree from completed split points, keyed by relpath.
+
+    Each completed split point becomes a leaf at its relpath; every ancestor
+    directory becomes an inner node.  Leaf ``overview`` is the split's own
+    overview (relative to root_output); inner-node ``overview`` is filled in
+    by :func:`_write_layer_overviews`.
+    """
+    tree: Dict[str, Any] = {}
+
+    def parent_dict(parts: List[str]) -> Dict[str, Any]:
+        node = tree
+        for i, seg in enumerate(parts[:-1]):
+            if seg not in node:
+                node[seg] = {
+                    "components": [],
+                    "children": {},
+                    "relpath": "/".join(parts[: i + 1]),
+                    "overview": "",
+                }
+            node = node[seg]["children"]
+        return node
+
+    for sp, entry in done_splits:
+        rel = sp.relpath
+        if not rel or rel == ".":
+            rel = sp.safe_name
+        parts = rel.split("/")
+        parent = parent_dict(parts)
+        leaf_key = parts[-1] if parts else sp.safe_name
+        if leaf_key in parent:
+            leaf_key = "{}_{}".format(leaf_key, sp.safe_name)
+        ov = entry.get("overview", "")
+        parent[leaf_key] = {
+            "components": [],
+            "children": {},
+            "relpath": sp.relpath,
+            "overview": os.path.relpath(ov, str(root_output)) if ov else "",
+            "module_count": entry.get("module_count", 0),
+            "status": entry.get("status", "done"),
+        }
+    return tree
+
+
+def _write_layer_overviews(
+    node: Dict[str, Any], root_output: Path, layer_base: Path
+) -> None:
+    """Write an aggregate overview page for every inner node in *node*.
+
+    Each page lists the direct children (sub-modules and sub-layers) with links
+    to their overviews, so a layer ties together every module beneath it.
+    Leaves are left untouched.  Inner-node ``overview`` is set to the page path
+    relative to root_output so the viewer can navigate to it.
+    """
+    for key, data in node.items():
+        children = data.get("children")
+        if not children:
+            continue
+        _write_layer_overviews(children, root_output, layer_base)
+        relpath = data.get("relpath") or key
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", relpath).strip("_") or key
+        layer_dir = layer_base / safe
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        ov_path = layer_dir / "overview.md"
+        lines = ["# " + relpath, "", "本层包含的子模块：", ""]
+        for ck, cv in children.items():
+            cov = cv.get("overview", "")
+            link = os.path.relpath(
+                str(root_output / cov), str(layer_dir)
+            ) if cov else ""
+            mc = cv.get("module_count")
+            suffix = " - {} modules".format(mc) if mc is not None else ""
+            lines.append("- [{}]({}){}".format(ck, link, suffix))
+        ov_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        data["overview"] = os.path.relpath(ov_path, str(root_output))
+
+
 def aggregate_splits(
     root_output: Path,
     root_name: str,
@@ -377,9 +457,9 @@ def aggregate_splits(
     """
     root_output.mkdir(parents=True, exist_ok=True)
 
-    aggregate_tree: Dict[str, Any] = {}
     index_entries: List[Dict[str, Any]] = []
     child_docs: Dict[str, Dict[str, Any]] = {}
+    done_splits: List[Tuple[SplitPoint, Dict[str, Any]]] = []
 
     for sp, entry in splits:
         name = sp.safe_name
@@ -393,17 +473,10 @@ def aggregate_splits(
             except OSError:
                 overview_text = ""
 
-        # Only completed splits contribute to the top-level architecture tree
-        # and the LLM overview (they're the ones with real docs to summarize).
+        # Only completed splits contribute to the architecture tree and the
+        # LLM overview (they're the ones with real docs to summarize).
         if is_done:
-            aggregate_tree[name] = {
-                "components": [],
-                "children": {},
-                "relpath": sp.relpath,
-                "module_count": entry.get("module_count", 0),
-                "status": status,
-                "overview": name + ".md",
-            }
+            done_splits.append((sp, entry))
             child_docs[name] = {
                 "docs": overview_text,
                 "relpath": sp.relpath,
@@ -424,6 +497,15 @@ def aggregate_splits(
             "overview": entry.get("overview", ""),
             "module_tree": entry.get("module_tree", ""),
         })
+
+    # Build a nested tree keyed by relpath so the viewer renders the real
+    # directory hierarchy (src1 > be3 > {agent_tools3, dependency_analyzer3})
+    # instead of a flat list. Intermediate directories get their own aggregate
+    # overview page linking every sub-module beneath them.
+    aggregate_tree = _build_nested_tree(done_splits, root_output)
+    _write_layer_overviews(
+        aggregate_tree, root_output, root_output / SPLITS_SUBDIR / "_layers"
+    )
 
     from codewiki.src.utils import file_manager
     file_manager.save_json(aggregate_tree, str(root_output / "module_tree.json"))
@@ -488,11 +570,12 @@ def aggregate_splits(
         else:
             content = resp.strip()
         link_section = ["", "## Sub-module documentation", ""]
-        for e in index_entries:
-            ov = e.get("overview", "")
+        for key, data in aggregate_tree.items():
+            ov = data.get("overview", "")
             link = os.path.relpath(ov, str(root_output)) if ov else ""
-            link_section.append("- [{name} ({rel})]({link}) - {mc} modules".format(
-                name=e["name"], rel=e["relpath"], link=link, mc=e["module_count"]))
+            mc = data.get("module_count")
+            suffix = " - {} modules".format(mc) if mc is not None else " (layer)"
+            link_section.append("- [{}]({}){}".format(key, link, suffix))
         overview_path.write_text(
             content + "\n" + "\n".join(link_section) + "\n",
             encoding="utf-8",
