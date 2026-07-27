@@ -664,6 +664,31 @@ def generate_command(
                     logger.success(f"Generated top-level index.html at {output_dir}")
                 except Exception as e:
                     logger.warning(f"Top-level HTML generation failed: {e}")
+
+            # --- Knowledge base linking (same hook as non-split mode) ---
+            # Sub-runs pass --no-kb; the top level owns linking the aggregated
+            # output into the knowledge base so split docs appear in the index.
+            if not no_kb:
+                from codewiki.cli.knowledge_base import (
+                    link_to_knowledge_base,
+                    DEFAULT_KB_DIR,
+                    DEFAULT_KB_PORT,
+                )
+                try:
+                    from codewiki.cli.html_generator import HTMLGenerator
+                    _repo_info = HTMLGenerator().detect_repository_info(repo_path)
+                except Exception:
+                    _repo_info = {}
+                try:
+                    link_to_knowledge_base(
+                        output_dir=output_dir,
+                        repo_name=repo_path.name,
+                        repo_url=_repo_info.get("url"),
+                        kb_dir=kb_dir or DEFAULT_KB_DIR,
+                        kb_port=kb_port or DEFAULT_KB_PORT,
+                    )
+                except Exception as e:
+                    logger.warning(f"Knowledge base linking failed: {e}")
             sys.exit(rc if rc is not None else 0)
 
         # Initialize checkpoint manager (best-effort: backend module may not yet
