@@ -335,7 +335,7 @@ class CawBackend(LLMBackend):
         )
         num_tokens = count_tokens(components_with_code)
         can_delegate = (
-            config.analysis_mode != "coarse"
+            config.analysis_mode not in ("coarse", "fast")
             and is_complex_module(components, core_component_ids)
             and start_depth < config.effective_max_depth
             and num_tokens >= config.max_token_per_leaf_module

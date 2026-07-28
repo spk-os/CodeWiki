@@ -3,7 +3,7 @@ import os
 import json
 import asyncio
 import threading
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from copy import deepcopy
 import traceback
 
@@ -239,63 +239,68 @@ class DocumentationGenerator:
                 # When a key pool is configured, its own semaphore enforces the
                 # global concurrency limit AND round-robins keys across agents.
                 # Otherwise fall back to a plain local semaphore (single key).
-                if not use_pool:
-                    semaphore = asyncio.Semaphore(concurrency)
+                semaphore = None if use_pool else asyncio.Semaphore(concurrency)
                 logger.info(
                     f"📄 Processing {len(leaf_modules)} leaf modules "
                     f"with concurrency={concurrency}"
                     + (f" across {self.key_pool.size} keys" if use_pool else "")
                 )
 
-                async def process_leaf(mp, mn, mk):
-                    async def _run(api_key):
-                        try:
-                            mt = file_manager.load_json(module_tree_path)
-                            mi = mt
-                            for pp in mp:
-                                mi = mi[pp]
-                                if pp != mp[-1]:
-                                    mi = mi.get("children", {})
+                if self.config.analysis_mode == "fast":
+                    await self._run_fast_leaf_batches(
+                        leaf_modules, components, working_dir,
+                        module_tree_path, use_pool, semaphore, processed_modules,
+                    )
+                else:
+                    async def process_leaf(mp, mn, mk):
+                        async def _run(api_key):
+                            try:
+                                mt = file_manager.load_json(module_tree_path)
+                                mi = mt
+                                for pp in mp:
+                                    mi = mi[pp]
+                                    if pp != mp[-1]:
+                                        mi = mi.get("children", {})
 
-                            if self.ckpt is not None:
-                                self.ckpt.mark_running(mk)
+                                if self.ckpt is not None:
+                                    self.ckpt.mark_running(mk)
 
-                            logger.info(f"📄 Processing leaf module: {mk}")
-                            await self.backend.run_module_agent(
-                                module_name=mn,
-                                components=components,
-                                core_component_ids=mi["components"],
-                                module_path=mp,
-                                working_dir=working_dir,
-                                tree_lock=tree_lock,
-                                api_key=api_key,
-                            )
-
-                            expected_md = os.path.join(working_dir, f"{mn}.md")
-                            if not os.path.exists(expected_md):
-                                raise RuntimeError(
-                                    f"Module agent completed but {mn}.md was not created"
+                                logger.info(f"📄 Processing leaf module: {mk}")
+                                await self.backend.run_module_agent(
+                                    module_name=mn,
+                                    components=components,
+                                    core_component_ids=mi["components"],
+                                    module_path=mp,
+                                    working_dir=working_dir,
+                                    tree_lock=tree_lock,
+                                    api_key=api_key,
                                 )
 
-                            if self.ckpt is not None:
-                                self.ckpt.mark_done(mk)
-                            processed_modules.add(mk)
-                        except Exception as e:
-                            logger.error(f"Failed to process module {mk}: {str(e)}")
-                            logger.error(f"Traceback: {traceback.format_exc()}")
-                            if self.ckpt is not None:
-                                self.ckpt.mark_failed(mk, str(e))
+                                expected_md = os.path.join(working_dir, f"{mn}.md")
+                                if not os.path.exists(expected_md):
+                                    raise RuntimeError(
+                                        f"Module agent completed but {mn}.md was not created"
+                                    )
 
-                    if use_pool:
-                        async with self.key_pool.acquire() as api_key:
-                            await _run(api_key)
-                    else:
-                        async with semaphore:
-                            await _run(None)
+                                if self.ckpt is not None:
+                                    self.ckpt.mark_done(mk)
+                                processed_modules.add(mk)
+                            except Exception as e:
+                                logger.error(f"Failed to process module {mk}: {str(e)}")
+                                logger.error(f"Traceback: {traceback.format_exc()}")
+                                if self.ckpt is not None:
+                                    self.ckpt.mark_failed(mk, str(e))
 
-                await asyncio.gather(
-                    *[process_leaf(mp, mn, mk) for mp, mn, mk in leaf_modules]
-                )
+                        if use_pool:
+                            async with self.key_pool.acquire() as api_key:
+                                await _run(api_key)
+                        else:
+                            async with semaphore:
+                                await _run(None)
+
+                    await asyncio.gather(
+                        *[process_leaf(mp, mn, mk) for mp, mn, mk in leaf_modules]
+                    )
 
             # Process parent modules sequentially (they depend on children's docs)
             for module_path, module_name, module_key in parent_modules:
@@ -367,7 +372,157 @@ class DocumentationGenerator:
         
         return working_dir
 
-    async def generate_parent_module_docs(self, module_path: List[str], 
+    async def _run_fast_leaf_batches(
+        self,
+        leaf_modules,
+        components,
+        working_dir: str,
+        module_tree_path: str,
+        use_pool: bool,
+        semaphore: asyncio.Semaphore,
+        processed_modules: set,
+    ) -> None:
+        """Fast mode: bundle leaf modules into batches, one LLM call per batch.
+
+        Reuses the same concurrency framework as the per-module path (key pool
+        round-robin or local semaphore).  Each batch is a single
+        ``backend.complete()`` call producing N ``<MODULE_DOC>`` blocks; the
+        caller writes one ``{module_name}.md`` per parsed block.  Modules whose
+        block is missing from the response are left un-written so
+        ``validate_generated_docs`` reports them.
+        """
+        batch_size = max(1, self.config.fast_batch_size)
+        batches = [
+            leaf_modules[i:i + batch_size]
+            for i in range(0, len(leaf_modules), batch_size)
+        ]
+        logger.info(
+            f"⚡ fast mode: {len(leaf_modules)} leaf modules in {len(batches)} "
+            f"batches (batch_size={batch_size})"
+        )
+
+        async def process_batch(batch):
+            async def _run(api_key):
+                specs: List[tuple[str, List[str]]] = []
+                for mp, mn, mk in batch:
+                    mt = file_manager.load_json(module_tree_path)
+                    mi = mt
+                    for pp in mp:
+                        if pp not in mi:
+                            mi = {}
+                            break
+                        mi = mi[pp]
+                        if pp != mp[-1]:
+                            mi = mi.get("children", {})
+                    core_ids = mi.get("components", []) if isinstance(mi, dict) else []
+                    specs.append((mn, core_ids))
+                    if self.ckpt is not None:
+                        self.ckpt.mark_running(mk)
+                try:
+                    docs = await self._generate_leaf_batch_fast(
+                        specs, components, working_dir, api_key
+                    )
+                    for mp, mn, mk in batch:
+                        content = docs.get(mn)
+                        if content is None:
+                            # fuzzy name match (spaces/case) as a fallback
+                            for key, val in docs.items():
+                                if key.strip().lower() == mn.strip().lower():
+                                    content = val
+                                    break
+                        if content is not None:
+                            file_manager.save_text(
+                                content, os.path.join(working_dir, f"{mn}.md")
+                            )
+                            if self.ckpt is not None:
+                                self.ckpt.mark_done(mk)
+                            processed_modules.add(mk)
+                        else:
+                            logger.error(
+                                f"[fast] module {mn} missing in batch output; "
+                                f"will be reported by validate_generated_docs"
+                            )
+                            if self.ckpt is not None:
+                                self.ckpt.mark_failed(mk, "missing in batch output")
+                except Exception as e:
+                    logger.error(f"[fast] batch failed: {e}")
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    for mp, mn, mk in batch:
+                        if self.ckpt is not None:
+                            self.ckpt.mark_failed(mk, str(e))
+
+            if use_pool:
+                async with self.key_pool.acquire() as api_key:
+                    await _run(api_key)
+            else:
+                async with semaphore:
+                    await _run(None)
+
+        await asyncio.gather(*[process_batch(b) for b in batches])
+
+    async def _generate_leaf_batch_fast(
+        self,
+        specs: List[tuple[str, List[str]]],
+        components: Dict[str, Any],
+        working_dir: str,
+        api_key: Optional[str],
+    ) -> Dict[str, str]:
+        """One LLM call for a batch of modules; returns {module_name: markdown}."""
+        from codewiki.src.be.prompt_template import (
+            FAST_BATCH_SYSTEM_PROMPT,
+            format_fast_batch_user_prompt,
+        )
+
+        module_tree = file_manager.load_json(
+            os.path.join(working_dir, MODULE_TREE_FILENAME)
+        )
+        ci = self.config.get_prompt_addition()
+        custom_section = ""
+        priority_directive = ""
+        if ci:
+            custom_section = f"\n\n<CUSTOM_INSTRUCTIONS>\n{ci}\n</CUSTOM_INSTRUCTIONS>"
+            priority_directive = (
+                "<PRIORITY_DIRECTIVE>\n"
+                "The following instructions OVERRIDE the default behavior of this prompt. "
+                "You MUST follow them strictly, even if they conflict with the language or "
+                "style of the surrounding prompt.\n"
+                f"{ci}\n"
+                "</PRIORITY_DIRECTIVE>\n"
+            )
+
+        system_prompt = FAST_BATCH_SYSTEM_PROMPT.format(
+            batch_size=len(specs),
+            custom_instructions=custom_section,
+            priority_directive=priority_directive,
+        )
+        user_prompt = format_fast_batch_user_prompt(
+            modules=specs,
+            components=components,
+            module_tree=module_tree,
+            context_window=self.config.effective_context_window,
+        )
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+
+        response = await asyncio.to_thread(
+            self.backend.complete, full_prompt, api_key=api_key
+        )
+        return self._parse_module_docs(response, [name for name, _ in specs])
+
+    @staticmethod
+    def _parse_module_docs(response: str, names: List[str]) -> Dict[str, str]:
+        """Parse <MODULE_DOC name="X">...</MODULE_DOC> blocks from response."""
+        import re
+        results: Dict[str, str] = {}
+        pattern = re.compile(
+            r'<MODULE_DOC\s+name="([^"]*)">\s*(.*?)</MODULE_DOC>',
+            re.DOTALL,
+        )
+        for m in pattern.finditer(response or ""):
+            name = m.group(1).strip()
+            results[name] = m.group(2).strip()
+        return results
+
+    async def generate_parent_module_docs(self, module_path: List[str],
                                         working_dir: str) -> Dict[str, Any]:
         """Generate documentation for a parent module based on its children's documentation."""
         module_name = module_path[-1] if len(module_path) >= 1 else os.path.basename(os.path.normpath(self.config.repo_path))

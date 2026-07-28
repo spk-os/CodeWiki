@@ -90,8 +90,12 @@ class Config:
     llm_timeout: int = DEFAULT_LLM_TIMEOUT
     llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES
     llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL
-    # Analysis mode: "standard" (default), "coarse" (fast, shallow), "fine" (detailed, deep)
+    # Analysis mode: "standard" (default), "coarse" (fast, shallow), "fine" (detailed, deep), "fast" (batch, fewest LLM calls)
     analysis_mode: str = "standard"
+    # Fast mode: how many leaf modules to bundle into a single LLM `complete()`
+    # call.  Larger = fewer calls (LLM is the bottleneck) but lower per-module
+    # fidelity.  Ignored outside fast mode.
+    fast_batch_size: int = 8
 
     def __post_init__(self):
         # When multi-key api_keys is configured but llm_api_key is empty or
@@ -129,7 +133,7 @@ class Config:
 
     @property
     def effective_max_depth(self) -> int:
-        if self.analysis_mode == "coarse":
+        if self.analysis_mode in ("coarse", "fast"):
             return 1
         if self.analysis_mode == "fine":
             return max(self.max_depth, 3)
@@ -274,6 +278,7 @@ class Config:
         llm_max_retries: int = DEFAULT_LLM_MAX_RETRIES,
         llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL,
         analysis_mode: str = "standard",
+        fast_batch_size: int = 8,
     ) -> 'Config':
         """
         Create configuration for CLI context.
@@ -331,4 +336,5 @@ class Config:
             llm_max_retries=llm_max_retries,
             llm_retry_interval=llm_retry_interval,
             analysis_mode=analysis_mode,
+            fast_batch_size=fast_batch_size,
         )

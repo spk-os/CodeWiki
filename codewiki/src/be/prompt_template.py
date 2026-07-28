@@ -87,6 +87,29 @@ You MUST call `str_replace_editor` with `command="create"` to write the `{module
 {custom_instructions}
 """.strip()
 
+FAST_BATCH_SYSTEM_PROMPT = """
+{priority_directive}
+<ROLE>
+You are an AI documentation assistant in FAST mode. You receive {batch_size} modules at once and must generate one independent markdown documentation file per module. Overall architecture and cross-module flow must stay accurate; per-module internal detail may be coarse.
+</ROLE>
+
+<OUTPUT_FORMAT>
+For EACH module, emit its documentation wrapped in an exact XML tag:
+<MODULE_DOC name="MODULE_NAME">
+...full markdown for that module...
+</MODULE_DOC>
+
+Rules:
+- Emit one <MODULE_DOC> block per requested module, using the EXACT module name provided in each <MODULE_BATCH_ITEM>.
+- Do NOT merge modules or skip any. If a module has no code, still emit a short stub doc.
+- Markdown inside each block is self-contained (headings, a Mermaid architecture diagram where useful, references to sibling modules as [text](other_module.md)).
+- Keep each module's doc focused and concise — no per-method line-by-line detail.
+- Output ONLY the <MODULE_DOC> blocks, nothing outside them.
+</OUTPUT_FORMAT>
+
+{custom_instructions}
+""".strip()
+
 USER_PROMPT = """
 Generate comprehensive documentation for the {module_name} module using the provided module tree and core components.
 
@@ -523,6 +546,41 @@ def format_leaf_system_prompt(module_name: str, custom_instructions: str = None)
         custom_instructions=custom_section,
         priority_directive=priority_directive,
     ).strip()
+
+
+def format_fast_batch_user_prompt(
+    modules: list[tuple[str, list[str]]],
+    components: Dict[str, Any],
+    module_tree: dict[str, any],
+    context_window: int = 0,
+) -> str:
+    """Build a single user prompt covering *modules* at once (fast mode).
+
+    *modules* is a list of ``(module_name, core_component_ids)`` tuples.  Each
+    module is rendered via :func:`format_user_prompt` (which already embeds the
+    component source code, truncated to the context window) and wrapped in a
+    ``<MODULE_BATCH_ITEM>`` tag so the model can map outputs back to modules.
+    """
+    items = []
+    for module_name, core_component_ids in modules:
+        if not core_component_ids:
+            body = f"# Module: {module_name}\n(no core components)\n"
+        else:
+            body = format_user_prompt(
+                module_name=module_name,
+                core_component_ids=core_component_ids,
+                components=components,
+                module_tree=module_tree,
+                context_window=context_window,
+            )
+        items.append(f'<MODULE_BATCH_ITEM name="{module_name}">\n{body}\n</MODULE_BATCH_ITEM>')
+
+    return (
+        f"Generate documentation for each of the {len(modules)} modules below. "
+        "Emit one <MODULE_DOC name=\"...\"> block per module, in any order, "
+        "using the EXACT module name from each <MODULE_BATCH_ITEM>.\n\n"
+        + "\n\n".join(items)
+    )
 
 
 def format_file_cluster_prompt(file_paths: list[str], module_name: str = None) -> str:

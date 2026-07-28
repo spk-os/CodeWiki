@@ -125,7 +125,7 @@ class PydanticAIBackend(LLMBackend):
             return module_tree
 
         use_delegation = (
-            config.analysis_mode != "coarse"
+            config.analysis_mode not in ("coarse", "fast")
             and is_complex_module(components, core_component_ids)
         )
         # Pick the model set for this call's API key (per-key pool when

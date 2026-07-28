@@ -671,6 +671,32 @@ def cluster_modules(
         _merge_module_tree(current_module_tree, cached_tree, current_module_path)
         return cached_tree
 
+    # Fast mode: skip LLM clustering entirely. Group leaf nodes by directory
+    # via the existing _directory_pre_cluster (zero LLM calls).  When no
+    # further directory/file split is possible it returns None, in which case
+    # we fall back to whole-module documentation mode (also no clustering LLM).
+    if config.analysis_mode == "fast":
+        logger.info(
+            "[fast] Skipping LLM clustering for %s (%d leaf nodes); "
+            "using directory-based pre-clustering",
+            module_label,
+            len(leaf_nodes),
+        )
+        pre = _directory_pre_cluster(
+            leaf_nodes,
+            components,
+            config,
+            current_module_tree,
+            current_module_name,
+            current_module_path,
+            completer=completer,
+            _depth=_depth,
+            checkpoint=checkpoint,
+        )
+        if pre is None:
+            return {}
+        return pre
+
     potential_core_components, potential_core_components_with_code = (
         format_potential_core_components(leaf_nodes, components)
     )

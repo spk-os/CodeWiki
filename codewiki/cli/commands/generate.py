@@ -346,9 +346,18 @@ def _viewer_lang(instructions: Optional[str]) -> str:
 )
 @click.option(
     "--mode",
-    type=click.Choice(['standard', 'coarse', 'fine'], case_sensitive=False),
+    type=click.Choice(['standard', 'coarse', 'fine', 'fast'], case_sensitive=False),
     default=None,
-    help="Analysis mode: coarse (fast, no sub-agent delegation), fine (deep, max_depth>=3), standard (default)",
+    help="Analysis mode: coarse (no sub-agent delegation), fine (deep, max_depth>=3), "
+         "fast (batch leaf docs, fewest LLM calls — best for very large repos), "
+         "standard (default)",
+)
+@click.option(
+    "--fast-batch-size",
+    type=int,
+    default=None,
+    help="fast mode only: number of leaf modules bundled into one LLM call "
+         "(default 8). Larger = fewer calls but lower per-module detail.",
 )
 @click.option(
     "--split",
@@ -453,6 +462,7 @@ def generate_command(
     cache_dir: Optional[str] = None,
     concurrency: Optional[int] = None,
     mode: Optional[str] = None,
+    fast_batch_size: Optional[int] = None,
     split: int = 0,
     split_overrides: Tuple[str, ...] = (),
     split_root: Optional[str] = None,
@@ -560,7 +570,17 @@ def generate_command(
         # (not the comma-separated string).  Use the first key for client auth;
         # the ApiKeyPool handles round-robin distribution during concurrent calls.
         effective_api_key = raw_api_key.split(',')[0].strip() if raw_api_key else ''
-        
+        # Multi-key passthrough: when --api-key (singular) carries a
+        # comma-separated list, the CLI config object's ``api_keys`` field is
+        # never populated (only the keyring ``api_key`` slot is).  Forward the
+        # full comma-separated string here so CLIDocumentationGenerator builds
+        # an ApiKeyPool and effective_concurrency > 1; otherwise leaf modules
+        # run serially under Semaphore(1) even with multiple keys.
+        effective_api_keys = (
+            raw_api_key if (raw_api_key and ',' in raw_api_key)
+            else (config.api_keys or '')
+        )
+
         logger.success("Configuration valid")
         
         # Validate repository
@@ -615,13 +635,14 @@ def generate_command(
                 'max_token_per_leaf_module': max_token_per_leaf_module if max_token_per_leaf_module is not None else config.max_token_per_leaf_module,
                 'max_depth': max_depth if max_depth is not None else config.max_depth,
                 'disable_proxy': config.disable_proxy,
-                'api_keys': config.api_keys,
+                'api_keys': effective_api_keys,
                 'concurrency': concurrency if concurrency is not None else config.effective_concurrency,
                 'model_context_window': config.model_context_window,
                 'llm_timeout': config.llm_timeout,
                 'llm_max_retries': config.llm_max_retries,
                 'llm_retry_interval': config.llm_retry_interval,
                 'analysis_mode': mode or 'standard',
+                'fast_batch_size': fast_batch_size if fast_batch_size is not None else 8,
                 'cache_dir': eff_cache,
                 'resume': resume,
             }
@@ -862,13 +883,14 @@ def generate_command(
                 'resume': resume,
                 'cache_dir': effective_cache_dir,
                 'disable_proxy': config.disable_proxy,
-                'api_keys': config.api_keys,
+                'api_keys': effective_api_keys,
                 'concurrency': concurrency if concurrency is not None else config.effective_concurrency,
                 'model_context_window': config.model_context_window,
                 'llm_timeout': config.llm_timeout,
                 'llm_max_retries': config.llm_max_retries,
                 'llm_retry_interval': config.llm_retry_interval,
                 'analysis_mode': mode or 'standard',
+                'fast_batch_size': fast_batch_size if fast_batch_size is not None else 8,
             },
             verbose=verbose,
             generate_html=github_pages,
