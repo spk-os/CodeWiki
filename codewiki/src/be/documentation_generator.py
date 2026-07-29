@@ -233,6 +233,17 @@ class DocumentationGenerator:
                 else:
                     parent_modules.append((module_path, module_name, module_key))
 
+            # L0 file-summary layer (C) + reverse call index (A): built once
+            # before leaf generation so every leaf prompt can cite digested
+            # summaries + the call graph instead of raw source.  Source
+            # digestion moves off the big model (the bottleneck).
+            reverse_call_index = self._build_reverse_call_index(components)
+            l0_summaries: Dict[str, str] = {}
+            if self.config.effective_l0_enabled:
+                n_files = len({n.relative_path for n in components.values()})
+                logger.info(f"🧠 [L0] generating file summaries for {n_files} files")
+                l0_summaries = await self.generate_l0_summaries(components, working_dir)
+
             if leaf_modules:
                 concurrency = self.config.effective_concurrency
                 use_pool = self.key_pool is not None
@@ -250,6 +261,8 @@ class DocumentationGenerator:
                     await self._run_fast_leaf_batches(
                         leaf_modules, components, working_dir,
                         module_tree_path, use_pool, semaphore, processed_modules,
+                        l0_summaries=l0_summaries,
+                        reverse_call_index=reverse_call_index,
                     )
                 else:
                     async def process_leaf(mp, mn, mk):
@@ -274,6 +287,8 @@ class DocumentationGenerator:
                                     working_dir=working_dir,
                                     tree_lock=tree_lock,
                                     api_key=api_key,
+                                    l0_summaries=l0_summaries,
+                                    reverse_call_index=reverse_call_index,
                                 )
 
                                 expected_md = os.path.join(working_dir, f"{mn}.md")
@@ -381,6 +396,8 @@ class DocumentationGenerator:
         use_pool: bool,
         semaphore: asyncio.Semaphore,
         processed_modules: set,
+        l0_summaries: Dict[str, str] = None,
+        reverse_call_index: Dict[str, List[str]] = None,
     ) -> None:
         """Fast mode: bundle leaf modules into batches, one LLM call per batch.
 
@@ -420,7 +437,9 @@ class DocumentationGenerator:
                         self.ckpt.mark_running(mk)
                 try:
                     docs = await self._generate_leaf_batch_fast(
-                        specs, components, working_dir, api_key
+                        specs, components, working_dir, api_key,
+                        l0_summaries=l0_summaries,
+                        reverse_call_index=reverse_call_index,
                     )
                     for mp, mn, mk in batch:
                         content = docs.get(mn)
@@ -466,6 +485,8 @@ class DocumentationGenerator:
         components: Dict[str, Any],
         working_dir: str,
         api_key: Optional[str],
+        l0_summaries: Dict[str, str] = None,
+        reverse_call_index: Dict[str, List[str]] = None,
     ) -> Dict[str, str]:
         """One LLM call for a batch of modules; returns {module_name: markdown}."""
         from codewiki.src.be.prompt_template import (
@@ -500,6 +521,9 @@ class DocumentationGenerator:
             components=components,
             module_tree=module_tree,
             context_window=self.config.effective_context_window,
+            condensed=self.config.effective_condensed_view,
+            l0_summaries=l0_summaries,
+            reverse_call_index=reverse_call_index,
         )
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
@@ -520,6 +544,119 @@ class DocumentationGenerator:
         for m in pattern.finditer(response or ""):
             name = m.group(1).strip()
             results[name] = m.group(2).strip()
+        return results
+
+    @staticmethod
+    def _build_reverse_call_index(components) -> Dict[str, List[str]]:
+        """{callee_id: [caller_ids]} from Node.depends_on, for the call-graph
+        section of the condensed leaf prompt (A).  Computed in-place from the
+        already-filled dependency graph — no change to ast_parser."""
+        rev: Dict[str, List[str]] = {}
+        for cid, node in components.items():
+            deps = getattr(node, "depends_on", None) or []
+            for dep in deps:
+                rev.setdefault(dep, []).append(cid)
+        return rev
+
+    async def generate_l0_summaries(
+        self, components, working_dir: str
+    ) -> Dict[str, str]:
+        """L0 file-summary layer (C): a small model digests each file into 1-3
+        sentences once, cached by file path + source hash.
+
+        Source digestion moves off the big model (the bottleneck).  Cache key
+        is a stable ``{"f": path, "h": source_hash}`` JSON string so unchanged
+        files skip the LLM on re-runs (increment-friendly).  Runs via
+        ``call_llm`` direct (small model, batched) — the caw subprocess overhead
+        would defeat the point; under caw provider this may raise, in which
+        case the exception is swallowed and leaves fall back to source snippets.
+        """
+        from codewiki.src.be.prompt_template import (
+            L0_SUMMARY_SYSTEM_PROMPT, format_l0_batch_prompt,
+        )
+        from codewiki.src.be.utils import source_content_hash
+        from codewiki.src.be.llm_services import call_llm
+
+        # Collect unique file paths -> one representative node (for source load).
+        file_to_node = {}
+        for n in components.values():
+            rp = getattr(n, "relative_path", None)
+            if rp and rp not in file_to_node:
+                file_to_node[rp] = n
+
+        file_paths = list(file_to_node.keys())
+        summaries: Dict[str, str] = {}
+        if not file_paths:
+            return summaries
+
+        batch_size = max(1, self.config.l0_batch_size)
+        l0_model = self.config.effective_l0_model
+        L0_CACHE_MODEL = "__L0_file_summary__"
+
+        def _key_and_src(path):
+            node = file_to_node[path]
+            try:
+                src = file_manager.load_text(node.file_path)
+            except (FileNotFoundError, IOError, OSError):
+                src = getattr(node, "source_code", None) or ""
+            key = json.dumps(
+                {"f": path, "h": source_content_hash(src)}, ensure_ascii=False
+            )
+            return key, src
+
+        # Pre-fill cache hits so unchanged files never hit the LLM.
+        pending = []
+        for path in file_paths:
+            key, _ = _key_and_src(path)
+            if self.ckpt is not None:
+                cached = self.ckpt.get_llm_cache(key, L0_CACHE_MODEL)
+                if cached:
+                    summaries[path] = cached
+                    continue
+            pending.append(path)
+
+        n_batches = (len(pending) + batch_size - 1) // batch_size
+        logger.info(
+            "[L0] %d/%d cache hits; %d files in %d batches to generate",
+            len(summaries), len(file_paths), len(pending), n_batches,
+        )
+
+        # Generate missing in batches.
+        for i in range(0, len(pending), batch_size):
+            batch = pending[i:i + batch_size]
+            user_prompt = format_l0_batch_prompt(batch, components)
+            full_prompt = f"{L0_SUMMARY_SYSTEM_PROMPT}\n\n{user_prompt}"
+            try:
+                response = await asyncio.to_thread(
+                    call_llm, full_prompt, self.config, l0_model
+                )
+            except Exception as e:
+                logger.error("[L0] batch failed (%s...): %s", batch[0], e)
+                continue
+            parsed = self._parse_file_summaries(response, batch)
+            for path, summary in parsed.items():
+                summaries[path] = summary
+                key, _ = _key_and_src(path)
+                if self.ckpt is not None and summary:
+                    self.ckpt.save_llm_cache(key, L0_CACHE_MODEL, summary)
+            # report any files the model skipped so the user sees the gap
+            for path in batch:
+                if path not in parsed:
+                    logger.warning("[L0] no summary for %s; leaf will fall back to snippet", path)
+        return summaries
+
+    @staticmethod
+    def _parse_file_summaries(response: str, names) -> Dict[str, str]:
+        """Parse <FILE_SUMMARY path="X">...</FILE_SUMMARY> blocks."""
+        import re
+        results: Dict[str, str] = {}
+        pattern = re.compile(
+            r'<FILE_SUMMARY\s+path="([^"]*)">\s*(.*?)</FILE_SUMMARY>',
+            re.DOTALL,
+        )
+        for m in pattern.finditer(response or ""):
+            p = m.group(1).strip()
+            results[p] = m.group(2).strip()
         return results
 
     async def generate_parent_module_docs(self, module_path: List[str],

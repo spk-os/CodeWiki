@@ -96,6 +96,16 @@ class Config:
     # call.  Larger = fewer calls (LLM is the bottleneck) but lower per-module
     # fidelity.  Ignored outside fast mode.
     fast_batch_size: int = 8
+    # Condensed view (A): in coarse/fast modes the leaf prompt replaces full
+    # file source with a signature + call-graph + L0-summary card, so the big
+    # model no longer ingests raw source.  standard/fine keep full source.
+    condensed_view: bool = False
+    # L0 file-summary layer (C): a small model digests each file into 1-3
+    # sentences once, cached by file path + source hash.  Source digestion
+    # moves off the big model (the bottleneck).  Serves fast mode by default.
+    l0_summary_enabled: bool = False
+    l0_model: Optional[str] = None
+    l0_batch_size: int = 8
 
     def __post_init__(self):
         # When multi-key api_keys is configured but llm_api_key is empty or
@@ -138,6 +148,21 @@ class Config:
         if self.analysis_mode == "fine":
             return max(self.max_depth, 3)
         return self.max_depth
+
+    @property
+    def effective_condensed_view(self) -> bool:
+        """Whether leaf prompts use the signature+summary card instead of full source."""
+        return self.analysis_mode in ("coarse", "fast") or self.condensed_view
+
+    @property
+    def effective_l0_enabled(self) -> bool:
+        """Whether the L0 file-summary layer runs before leaf generation."""
+        return self.analysis_mode == "fast" or self.l0_summary_enabled
+
+    @property
+    def effective_l0_model(self) -> str:
+        """Small model used to digest files into L0 summaries."""
+        return self.l0_model or self.cluster_model or self.main_model
 
     MODEL_CONTEXT_MAP = {
         "deepseek-v4-flash-free": 1048565,
@@ -279,6 +304,10 @@ class Config:
         llm_retry_interval: int = DEFAULT_LLM_RETRY_INTERVAL,
         analysis_mode: str = "standard",
         fast_batch_size: int = 8,
+        condensed_view: bool = False,
+        l0_summary_enabled: bool = False,
+        l0_model: Optional[str] = None,
+        l0_batch_size: int = 8,
     ) -> 'Config':
         """
         Create configuration for CLI context.
@@ -337,4 +366,8 @@ class Config:
             llm_retry_interval=llm_retry_interval,
             analysis_mode=analysis_mode,
             fast_batch_size=fast_batch_size,
+            condensed_view=condensed_view,
+            l0_summary_enabled=l0_summary_enabled,
+            l0_model=l0_model,
+            l0_batch_size=l0_batch_size,
         )

@@ -110,6 +110,24 @@ Rules:
 {custom_instructions}
 """.strip()
 
+L0_SUMMARY_SYSTEM_PROMPT = """
+You are a code summarizer for the L0 layer. For each file, produce a concise summary that lets a downstream module-documentation agent understand the file WITHOUT reading its source.
+
+For EACH file emit a block:
+<FILE_SUMMARY path="RELATIVE_PATH">
+- Purpose: one sentence on what this file does.
+- Key symbols: the most important functions/classes/types and their one-line role (<=8 items).
+- Exports / public API: what other files consume.
+- Dependencies: notable other files/modules it relies on.
+</FILE_SUMMARY>
+
+Rules:
+- 1-3 sentences of prose plus the symbol list. No code dumps.
+- Be accurate and concrete; this summary drives architecture-level docs.
+- Emit one block per file, using the EXACT path given. Do not merge or skip files.
+- Output ONLY the <FILE_SUMMARY> blocks.
+""".strip()
+
 USER_PROMPT = """
 Generate comprehensive documentation for the {module_name} module using the provided module tree and core components.
 
@@ -321,12 +339,117 @@ EXTENSION_TO_LANGUAGE = {
 }
 
 
+def _format_signature_card(node: Any) -> str:
+    """Condensed signature card for a component (A: source digestion off the big model)."""
+    name = node.qualified_name or node.display_name or node.name
+    lines = [f"### {name} ({node.component_type})"]
+    if node.base_classes:
+        lines.append(f"- bases: {', '.join(node.base_classes)}")
+    if node.parameters:
+        lines.append(f"- params: {', '.join(list(node.parameters)[:12])}")
+    if node.docstring:
+        ds = " ".join(node.docstring.split())
+        if len(ds) > 400:
+            ds = ds[:400] + "..."
+        lines.append(f"- docstring: {ds}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_condensed_components(
+    grouped_components: dict,
+    components: Dict[str, Any],
+    l0_summaries: dict,
+    reverse_call_index: dict,
+    max_content_tokens: int,
+) -> str:
+    """Build the CORE_COMPONENT_CODES body for condensed mode (A+C).
+
+    Per file: L0 summary (if available) + per-component signature card +
+    call-graph edges.  Falls back to a short source snippet (first N chars)
+    when no L0 summary exists, so a file is never silently empty.
+    """
+    from codewiki.src.be.utils import count_tokens
+
+    l0 = l0_summaries or {}
+    rev = reverse_call_index or {}
+    parts = []
+    used_tokens = 0
+
+    # Call-graph section across this module's components.
+    graph_lines = []
+    for path, cids in grouped_components.items():
+        for cid in cids:
+            node = components.get(cid)
+            if not node:
+                continue
+            deps = [d for d in (node.depends_on or []) if d in components]
+            if deps:
+                name = node.qualified_name or node.name
+                line = f"- {name} -> {deps}"
+                callers = rev.get(cid, [])
+                if callers:
+                    line += f"  (called by: {callers})"
+                graph_lines.append(line)
+    if graph_lines:
+        parts.append("## Call Graph (component dependencies)\n" + "\n".join(graph_lines) + "\n")
+
+    for path, cids in grouped_components.items():
+        parts.append(f"# File: {path}")
+        summary = l0.get(path)
+        if summary:
+            parts.append(f"## File Summary (L0)\n{summary}\n")
+        for cid in cids:
+            node = components.get(cid)
+            if node:
+                parts.append(_format_signature_card(node))
+        # Fallback snippet when no L0 summary: first chunk of source so the
+        # big model is never blind to a file it must document.
+        if not summary and cids:
+            node = components.get(cids[0])
+            if node and node.source_code:
+                budget = max_content_tokens - used_tokens
+                if budget > 200:
+                    char_budget = min(len(node.source_code), budget * 4)
+                    snippet = node.source_code[:char_budget]
+                    if char_budget < len(node.source_code):
+                        snippet += "\n# ... (snippet; full source via read_code_components)\n"
+                    parts.append(f"## Source snippet (no L0 summary):\n```\n{snippet}\n```\n")
+                    used_tokens += count_tokens(snippet)
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+def format_l0_batch_prompt(file_paths: list[str], components: Dict[str, Any]) -> str:
+    """Build a prompt asking for one <FILE_SUMMARY> per file (L0 layer, C)."""
+    items = []
+    for path in file_paths:
+        node = next((n for n in components.values() if n.relative_path == path), None)
+        if not node:
+            continue
+        try:
+            src = file_manager.load_text(node.file_path)
+        except (FileNotFoundError, IOError):
+            src = node.source_code or ""
+        items.append(
+            f'<FILE_BATCH_ITEM path="{path}">\n```\n{src}\n```\n</FILE_BATCH_ITEM>'
+        )
+    return (
+        f"Summarize each of the {len(items)} files below. Emit one "
+        '<FILE_SUMMARY path="..."> block per file, EXACT path, 1-3 sentences '
+        "+ key symbols. No code dumps.\n\n" + "\n\n".join(items)
+    )
+
+
 def format_user_prompt(
     module_name: str,
     core_component_ids: list[str],
     components: Dict[str, Any],
     module_tree: dict[str, any],
     context_window: int = 0,
+    condensed: bool = False,
+    l0_summaries: dict = None,
+    reverse_call_index: dict = None,
 ) -> str:
     """Format the user prompt with module name and organized core component codes.
 
@@ -388,6 +511,19 @@ def format_user_prompt(
     max_content_tokens = int(context_window * 0.6) if context_window > 0 else 0
     current_content_tokens = 0
     truncated_files = []
+
+    # Condensed mode (A+C): emit signature cards + L0 summaries + call graph
+    # instead of full file source, so the big model no longer ingests raw code.
+    if condensed:
+        core_component_codes = _format_condensed_components(
+            grouped_components, components, l0_summaries,
+            reverse_call_index, max_content_tokens,
+        )
+        return USER_PROMPT.format(
+            module_name=module_name,
+            formatted_core_component_codes=core_component_codes,
+            module_tree=formatted_module_tree,
+        )
 
     core_component_codes = ""
     for path, component_ids_in_file in grouped_components.items():
@@ -553,6 +689,9 @@ def format_fast_batch_user_prompt(
     components: Dict[str, Any],
     module_tree: dict[str, any],
     context_window: int = 0,
+    condensed: bool = False,
+    l0_summaries: dict = None,
+    reverse_call_index: dict = None,
 ) -> str:
     """Build a single user prompt covering *modules* at once (fast mode).
 
@@ -572,6 +711,9 @@ def format_fast_batch_user_prompt(
                 components=components,
                 module_tree=module_tree,
                 context_window=context_window,
+                condensed=condensed,
+                l0_summaries=l0_summaries,
+                reverse_call_index=reverse_call_index,
             )
         items.append(f'<MODULE_BATCH_ITEM name="{module_name}">\n{body}\n</MODULE_BATCH_ITEM>')
 

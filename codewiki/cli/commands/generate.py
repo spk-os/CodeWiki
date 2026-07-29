@@ -360,6 +360,35 @@ def _viewer_lang(instructions: Optional[str]) -> str:
          "(default 8). Larger = fewer calls but lower per-module detail.",
 )
 @click.option(
+    "--condensed-view/--no-condensed-view",
+    "condensed_view",
+    default=None,
+    help="Leaf prompts emit a signature + call-graph + L0-summary card instead "
+         "of full file source (A), so the big model ingests far less code. "
+         "Auto-on in coarse/fast modes; set explicitly to force it on/off.",
+)
+@click.option(
+    "--l0-summary/--no-l0-summary",
+    "l0_summary",
+    default=None,
+    help="Run the L0 file-summary layer (C): a small model digests each file "
+         "into 1-3 sentences once (cached by path+source hash), so the big "
+         "model reads digested summaries instead of raw source. Auto-on in "
+         "fast mode.",
+)
+@click.option(
+    "--l0-model",
+    "l0_model",
+    default=None,
+    help="Model used by the L0 summary layer (defaults to cluster_model).",
+)
+@click.option(
+    "--l0-batch-size",
+    type=int,
+    default=None,
+    help="Number of files digested per L0 summary call (default 8).",
+)
+@click.option(
     "--split",
     type=int,
     default=0,
@@ -463,6 +492,10 @@ def generate_command(
     concurrency: Optional[int] = None,
     mode: Optional[str] = None,
     fast_batch_size: Optional[int] = None,
+    condensed_view: Optional[bool] = None,
+    l0_summary: Optional[bool] = None,
+    l0_model: Optional[str] = None,
+    l0_batch_size: Optional[int] = None,
     split: int = 0,
     split_overrides: Tuple[str, ...] = (),
     split_root: Optional[str] = None,
@@ -643,6 +676,10 @@ def generate_command(
                 'llm_retry_interval': config.llm_retry_interval,
                 'analysis_mode': mode or 'standard',
                 'fast_batch_size': fast_batch_size if fast_batch_size is not None else 8,
+                'condensed_view': bool(condensed_view) if condensed_view is not None else False,
+                'l0_summary_enabled': bool(l0_summary) if l0_summary is not None else False,
+                'l0_model': l0_model,
+                'l0_batch_size': l0_batch_size if l0_batch_size is not None else 8,
                 'cache_dir': eff_cache,
                 'resume': resume,
             }
@@ -891,6 +928,10 @@ def generate_command(
                 'llm_retry_interval': config.llm_retry_interval,
                 'analysis_mode': mode or 'standard',
                 'fast_batch_size': fast_batch_size if fast_batch_size is not None else 8,
+                'condensed_view': bool(condensed_view) if condensed_view is not None else False,
+                'l0_summary_enabled': bool(l0_summary) if l0_summary is not None else False,
+                'l0_model': l0_model,
+                'l0_batch_size': l0_batch_size if l0_batch_size is not None else 8,
             },
             verbose=verbose,
             generate_html=github_pages,

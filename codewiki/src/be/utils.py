@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import re
 import sys
@@ -11,6 +12,16 @@ import traceback
 
 
 logger = logging.getLogger(__name__)
+
+
+def source_content_hash(text: str) -> str:
+    """Stable short hash of source text for cache keys.
+
+    Used by the L0 file-summary layer to detect whether a file's content
+    has changed since its summary was cached, without embedding the full
+    source into the cache key.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
 # ------------------------------------------------------------

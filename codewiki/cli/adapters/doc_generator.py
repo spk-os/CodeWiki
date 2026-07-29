@@ -75,6 +75,10 @@ class CLIDocumentationGenerator:
         self.llm_retry_interval = config.get('llm_retry_interval', 60)
         self.analysis_mode = config.get('analysis_mode', 'standard')
         self.fast_batch_size = config.get('fast_batch_size', 8)
+        self.condensed_view = config.get('condensed_view', False)
+        self.l0_summary_enabled = config.get('l0_summary_enabled', False)
+        self.l0_model = config.get('l0_model')
+        self.l0_batch_size = config.get('l0_batch_size', 8)
         self.checkpoint = None
         self.key_pool = None
         # The OpenAI client requires a single API key (not comma-separated).
@@ -202,6 +206,10 @@ class CLIDocumentationGenerator:
                 ('llm_retry_interval', self.llm_retry_interval),
                 ('analysis_mode', self.analysis_mode),
                 ('fast_batch_size', self.fast_batch_size),
+                ('condensed_view', self.condensed_view),
+                ('l0_summary_enabled', self.l0_summary_enabled),
+                ('l0_model', self.l0_model),
+                ('l0_batch_size', self.l0_batch_size),
             ):
                 if name in backend_params:
                     extra_kwargs[name] = value

@@ -275,6 +275,8 @@ class CawBackend(LLMBackend):
         working_dir: str,
         tree_lock: Optional[threading.RLock] = None,
         api_key: str | None = None,  # unused: subscription CLIs have no API key
+        l0_summaries: Optional[dict] = None,
+        reverse_call_index: Optional[dict] = None,
     ) -> Dict[str, Any]:
         self._tree_lock = tree_lock
         set_main_loop(asyncio.get_running_loop())
@@ -285,6 +287,10 @@ class CawBackend(LLMBackend):
             core_component_ids,
             module_path,
             working_dir,
+            1,
+            None,
+            l0_summaries,
+            reverse_call_index,
         )
 
     def _run_module_agent_sync(
@@ -296,6 +302,8 @@ class CawBackend(LLMBackend):
         working_dir: str,
         start_depth: int = 1,
         module_tree: Dict[str, Any] | None = None,
+        l0_summaries: Optional[dict] = None,
+        reverse_call_index: Optional[dict] = None,
     ) -> Dict[str, Any]:
         # ``start_depth`` lets the recursion preserve max_depth across nested
         # _run_module_agent_sync calls — each fresh deps object would otherwise
@@ -359,6 +367,9 @@ class CawBackend(LLMBackend):
             current_depth=start_depth,
             config=config,
             custom_instructions=custom_instructions,
+            l0_summaries=l0_summaries,
+            condensed_view=config.effective_condensed_view,
+            reverse_call_index=reverse_call_index,
         )
 
         toolkit = CawToolKit(deps=deps, backend=self, allow_subagent=can_delegate)
@@ -376,6 +387,10 @@ class CawBackend(LLMBackend):
             core_component_ids=core_component_ids,
             components=components,
             module_tree=deps.module_tree,
+            context_window=config.effective_context_window,
+            condensed=config.effective_condensed_view,
+            l0_summaries=l0_summaries,
+            reverse_call_index=reverse_call_index,
         )
 
         # caw forks claude / codex via subprocess.Popen without a cwd, so the

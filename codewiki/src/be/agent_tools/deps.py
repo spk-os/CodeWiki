@@ -15,3 +15,10 @@ class CodeWikiDeps:
     current_depth: int
     config: Config  # LLM configuration
     custom_instructions: str = None
+    # L0 file summaries {file_path: summary} from the L0 layer (C).  Lets the
+    # leaf (big-model) prompt cite digested summaries instead of raw source.
+    l0_summaries: dict = None
+    # Emit the condensed signature+summary card instead of full file source (A).
+    condensed_view: bool = False
+    # Reverse call index {callee_id: [caller_ids]} for the call-graph section.
+    reverse_call_index: dict = None

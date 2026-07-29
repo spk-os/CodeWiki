@@ -104,6 +104,8 @@ class PydanticAIBackend(LLMBackend):
         working_dir: str,
         tree_lock: Optional[threading.RLock] = None,
         api_key: Optional[str] = None,
+        l0_summaries: Optional[dict] = None,
+        reverse_call_index: Optional[dict] = None,
     ) -> Dict[str, Any]:
         config = self._config
         self._tree_lock = tree_lock
@@ -166,6 +168,9 @@ class PydanticAIBackend(LLMBackend):
             current_depth=1,
             config=config,
             custom_instructions=self._custom_instructions,
+            l0_summaries=l0_summaries,
+            condensed_view=config.effective_condensed_view,
+            reverse_call_index=reverse_call_index,
         )
 
         try:
@@ -176,6 +181,9 @@ class PydanticAIBackend(LLMBackend):
                     components=components,
                     module_tree=deps.module_tree,
                     context_window=config.effective_context_window,
+                    condensed=config.effective_condensed_view,
+                    l0_summaries=l0_summaries,
+                    reverse_call_index=reverse_call_index,
                 ),
                 deps=deps,
                 usage_limits=UsageLimits(request_limit=None),
