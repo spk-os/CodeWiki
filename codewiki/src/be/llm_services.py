@@ -6,8 +6,10 @@ return slightly non-standard responses (e.g. choices[].index = None).
 
 Supports multiple providers: openai-compatible, anthropic, bedrock, azure-openai.
 """
+import asyncio
 import logging
 import os
+import time
 from typing import Optional
 
 import httpx
@@ -16,7 +18,7 @@ from openai.types import chat
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from openai import OpenAI, BadRequestError, RateLimitError, APIConnectionError, APIStatusError
+from openai import OpenAI, AsyncOpenAI, BadRequestError
 
 from codewiki.src.config import Config, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_MAX_RETRIES, DEFAULT_LLM_RETRY_INTERVAL
 
@@ -67,19 +69,174 @@ class ProxyDisabledContext:
         self._restore()
 
 
-def _build_proxyless_httpx_client(timeout: int = DEFAULT_LLM_TIMEOUT) -> httpx.Client:
-    """Create an httpx.Client that ignores environment proxies."""
-    return httpx.Client(trust_env=False, timeout=httpx.Timeout(float(timeout)))
+class _RetryingHTTPTransport(httpx.BaseTransport):
+    """httpx transport that retries every failed request uniformly.
+
+    Retries on ANY transport exception OR any non-2xx response status, up to
+    ``max_retries`` attempts, sleeping a fixed ``retry_interval`` seconds
+    between attempts. There is no error-category distinction: timeouts,
+    connection errors, 4xx and 5xx responses are all retried identically, so
+    no transient failure path can leak past the LLM client un-retried.
+
+    Installing the retry policy at the httpx transport (client) layer — rather
+    than per call site — guarantees the SAME policy covers every code path
+    that builds a client via ``_build_proxyless_httpx_client``: direct
+    ``call_llm`` calls, pydantic-ai agent runs, and azure clients alike.
+    Each failed attempt and the final exhaustion are logged clearly.
+    """
+
+    def __init__(self, max_retries: int, retry_interval: int) -> None:
+        self._max_retries = max(1, int(max_retries))
+        self._retry_interval = max(0, int(retry_interval))
+        # Inner transport owns the actual HTTP I/O; trust_env=False keeps it
+        # proxy-free (the outer Client's trust_env is ignored once a custom
+        # transport is supplied).
+        self._real = httpx.HTTPTransport(trust_env=False)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        response: Optional[httpx.Response] = None
+        last_error = "unknown error"
+        for attempt in range(1, self._max_retries + 1):
+            response = None
+            try:
+                response = self._real.handle_request(request)
+                if response.status_code < 400:
+                    return response
+                # Non-2xx: read body once for a readable log line, then free
+                # the connection before retrying.
+                err_desc = f"HTTP {response.status_code}"
+                try:
+                    response.read()
+                    body = response.text[:300]
+                    if body:
+                        err_desc = f"{err_desc}: {body}"
+                except Exception:
+                    pass
+                last_error = err_desc
+            except Exception as e:  # noqa: BLE001 — retry on ANY failure
+                response = None
+                last_error = f"{type(e).__name__}: {e}"
+
+            if attempt < self._max_retries:
+                logger.warning(
+                    "[LLM Client] %s attempt %d/%d failed (%s). Retry in %ds...",
+                    url, attempt, self._max_retries,
+                    _truncate_error_msg(last_error, 300), self._retry_interval,
+                )
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                if self._retry_interval:
+                    time.sleep(self._retry_interval)
+            else:
+                logger.error(
+                    "[LLM Client] %s all %d attempts exhausted. Last failure: %s",
+                    url, self._max_retries, _truncate_error_msg(last_error, 500),
+                )
+
+        # Exhausted: return the last response so the openai SDK can raise a
+        # proper status error; if the last attempt threw, surface that.
+        if response is not None:
+            return response
+        raise httpx.TransportError(f"LLM client retries exhausted: {last_error}")
 
 
-def _build_proxyless_async_httpx_client(timeout: int = DEFAULT_LLM_TIMEOUT) -> httpx.AsyncClient:
-    """Create an httpx.AsyncClient that ignores environment proxies.
+class _RetryingAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """Async twin of :class:`_RetryingHTTPTransport` (see its docstring)."""
+
+    def __init__(self, max_retries: int, retry_interval: int) -> None:
+        self._max_retries = max(1, int(max_retries))
+        self._retry_interval = max(0, int(retry_interval))
+        self._real = httpx.AsyncHTTPTransport(trust_env=False)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        response: Optional[httpx.Response] = None
+        last_error = "unknown error"
+        for attempt in range(1, self._max_retries + 1):
+            response = None
+            try:
+                response = await self._real.handle_async_request(request)
+                if response.status_code < 400:
+                    return response
+                err_desc = f"HTTP {response.status_code}"
+                try:
+                    await response.aread()
+                    body = response.text[:300]
+                    if body:
+                        err_desc = f"{err_desc}: {body}"
+                except Exception:
+                    pass
+                last_error = err_desc
+            except Exception as e:  # noqa: BLE001 — retry on ANY failure
+                response = None
+                last_error = f"{type(e).__name__}: {e}"
+
+            if attempt < self._max_retries:
+                logger.warning(
+                    "[LLM Client] %s attempt %d/%d failed (%s). Retry in %ds...",
+                    url, attempt, self._max_retries,
+                    _truncate_error_msg(last_error, 300), self._retry_interval,
+                )
+                if response is not None:
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
+                if self._retry_interval:
+                    await asyncio.sleep(self._retry_interval)
+            else:
+                logger.error(
+                    "[LLM Client] %s all %d attempts exhausted. Last failure: %s",
+                    url, self._max_retries, _truncate_error_msg(last_error, 500),
+                )
+
+        if response is not None:
+            return response
+        raise httpx.TransportError(f"LLM client retries exhausted: {last_error}")
+
+
+def _retry_params(config: Config):
+    """Read the uniform retry policy (max attempts, fixed interval) from config."""
+    max_retries = getattr(config, 'llm_max_retries', DEFAULT_LLM_MAX_RETRIES)
+    retry_interval = getattr(config, 'llm_retry_interval', DEFAULT_LLM_RETRY_INTERVAL)
+    return max_retries, retry_interval
+
+
+def _build_proxyless_httpx_client(config: Config, timeout: Optional[int] = None) -> httpx.Client:
+    """Create an httpx.Client that ignores env proxies and retries uniformly.
+
+    The retry policy (``config.llm_max_retries`` / ``config.llm_retry_interval``)
+    is installed at the httpx transport layer so that every request through this
+    client is retried identically, regardless of which call path created it.
+    """
+    effective_timeout = timeout if timeout is not None else getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+    max_retries, retry_interval = _retry_params(config)
+    return httpx.Client(
+        transport=_RetryingHTTPTransport(max_retries, retry_interval),
+        trust_env=False,
+        timeout=httpx.Timeout(float(effective_timeout)),
+    )
+
+
+def _build_proxyless_async_httpx_client(config: Config, timeout: Optional[int] = None) -> httpx.AsyncClient:
+    """Create an httpx.AsyncClient that ignores env proxies and retries uniformly.
 
     Used for pydantic-ai OpenAIProvider (async clients), so sub-agent /
     FallbackModel calls also connect directly instead of honoring
-    HTTP_PROXY / HTTPS_PROXY / ALL_PROXY.
+    HTTP_PROXY / HTTPS_PROXY / ALL_PROXY, and benefit from the same
+    transport-layer retry as the sync path.
     """
-    return httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(float(timeout)))
+    effective_timeout = timeout if timeout is not None else getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+    max_retries, retry_interval = _retry_params(config)
+    return httpx.AsyncClient(
+        transport=_RetryingAsyncHTTPTransport(max_retries, retry_interval),
+        trust_env=False,
+        timeout=httpx.Timeout(float(effective_timeout)),
+    )
 
 
 def _should_use_max_completion_tokens(model_name: str, base_url: str) -> bool:
@@ -162,7 +319,8 @@ def _create_litellm_openai_client(config: Config) -> OpenAI:
         return OpenAI(
             api_key=config.llm_api_key or "not-needed-for-bedrock",
             base_url=config.llm_base_url or "https://api.openai.com/v1",
-            http_client=_build_proxyless_httpx_client(timeout=llm_timeout),
+            http_client=_build_proxyless_httpx_client(config, timeout=llm_timeout),
+            max_retries=0,  # retry handled uniformly at the httpx transport layer
         )
 
 
@@ -171,10 +329,14 @@ def create_main_model(config: Config, api_key: Optional[str] = None) -> Compatib
     return CompatibleOpenAIModel(
         model_name=config.main_model,
         provider=OpenAIProvider(
-            base_url=config.llm_base_url,
-            api_key=api_key or config.llm_api_key,
-            http_client=_build_proxyless_async_httpx_client(
-                getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+            # Pass a pre-built AsyncOpenAI so we can disable the SDK's own
+            # retries (max_retries=0) — the uniform retry lives at the httpx
+            # transport layer to avoid double-retry stacking.
+            openai_client=AsyncOpenAI(
+                base_url=config.llm_base_url,
+                api_key=api_key or config.llm_api_key or "api-key-not-set",
+                http_client=_build_proxyless_async_httpx_client(config),
+                max_retries=0,
             ),
         ),
         settings=_build_model_settings(config, config.main_model)
@@ -186,10 +348,11 @@ def create_fallback_model(config: Config, api_key: Optional[str] = None) -> Comp
     return CompatibleOpenAIModel(
         model_name=config.fallback_model,
         provider=OpenAIProvider(
-            base_url=config.llm_base_url,
-            api_key=api_key or config.llm_api_key,
-            http_client=_build_proxyless_async_httpx_client(
-                getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
+            openai_client=AsyncOpenAI(
+                base_url=config.llm_base_url,
+                api_key=api_key or config.llm_api_key or "api-key-not-set",
+                http_client=_build_proxyless_async_httpx_client(config),
+                max_retries=0,
             ),
         ),
         settings=_build_model_settings(config, config.fallback_model)
@@ -210,7 +373,8 @@ def create_openai_client(config: Config, api_key: Optional[str] = None, timeout:
         return OpenAI(
             api_key=api_key or config.llm_api_key,
             base_url=config.llm_base_url or "https://api.openai.com/v1",
-            http_client=_build_proxyless_httpx_client(timeout=effective_timeout),
+            http_client=_build_proxyless_httpx_client(config, timeout=effective_timeout),
+            max_retries=0,  # retry handled uniformly at the httpx transport layer
         )
 
 
@@ -221,11 +385,15 @@ def call_llm(
     temperature: float = 0.0,
     api_key: Optional[str] = None,
 ) -> str:
-    """Call LLM with timeout, retry, and logging.
+    """Call LLM; retries are handled uniformly at the httpx client layer.
 
-    Retries on transient errors (timeout, rate-limit, server errors)
-    up to ``config.llm_max_retries`` times, with ``config.llm_retry_interval``
-    seconds between attempts.  Each failure and retry is logged.
+    The underlying OpenAI/httpx client (see ``_build_proxyless_httpx_client``)
+    retries on ANY failure up to ``config.llm_max_retries`` times with a fixed
+    ``config.llm_retry_interval`` second interval, with clear per-attempt
+    logging. There is NO business-layer retry loop here on purpose: keeping
+    the retry policy in one place (the client transport) means it covers every
+    call path — direct ``call_llm``, pydantic-ai agent runs, azure, and litellm
+    — with no per-branch gaps or double-retry stacking.
 
     Args:
         prompt: The prompt to send
@@ -240,69 +408,7 @@ def call_llm(
     if model is None:
         model = config.main_model
 
-    max_retries = getattr(config, 'llm_max_retries', DEFAULT_LLM_MAX_RETRIES)
-    retry_interval = getattr(config, 'llm_retry_interval', DEFAULT_LLM_RETRY_INTERVAL)
-
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return _call_llm_single(prompt, config, model, temperature, api_key=api_key)
-        except _RETRIABLE_ERRORS as e:
-            last_error = e
-            error_type = type(e).__name__
-            # Rate-limit errors: respect server's retry-after if present
-            wait_seconds = retry_interval
-            if isinstance(e, RateLimitError):
-                retry_after = _extract_retry_after(e)
-                if retry_after:
-                    wait_seconds = max(wait_seconds, retry_after)
-
-            if attempt < max_retries:
-                logger.warning(
-                    "[LLM Retry] Attempt %d/%d failed (%s: %s). "
-                    "Retrying in %ds...",
-                    attempt, max_retries, error_type,
-                    _truncate_error_msg(str(e), 200),
-                    wait_seconds,
-                )
-                _sleep(wait_seconds)
-            else:
-                logger.error(
-                    "[LLM] All %d attempts exhausted. Last error: %s: %s",
-                    max_retries, error_type, _truncate_error_msg(str(e), 500),
-                )
-        except Exception as e:
-            # Non-retriable error (auth, bad request, etc.) — fail immediately
-            logger.error(
-                "[LLM] Non-retriable error on attempt %d: %s: %s",
-                attempt, type(e).__name__, _truncate_error_msg(str(e), 500),
-            )
-            raise
-
-    # All retries exhausted
-    raise last_error
-
-
-# Error types that warrant a retry (transient / rate-limit / timeout / server)
-_RETRIABLE_ERRORS = (
-    TimeoutError,
-    ConnectionError,
-    RateLimitError,
-    APIConnectionError,
-    APIStatusError,  # covers 5xx server errors
-)
-
-
-def _extract_retry_after(err: RateLimitError) -> Optional[int]:
-    """Extract Retry-After from a RateLimitError, if the server provides it."""
-    headers = getattr(err, 'headers', None) or {}
-    val = headers.get('retry-after')
-    if val:
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            pass
-    return None
+    return _call_llm_single(prompt, config, model, temperature, api_key=api_key)
 
 
 def _truncate_error_msg(msg: str, max_len: int) -> str:
@@ -310,12 +416,6 @@ def _truncate_error_msg(msg: str, max_len: int) -> str:
     if len(msg) <= max_len:
         return msg
     return msg[:max_len - 3] + "..."
-
-
-def _sleep(seconds: int):
-    """Sleep for the given number of seconds."""
-    import time as _time
-    _time.sleep(seconds)
 
 
 def _call_llm_single(
@@ -396,10 +496,16 @@ def _call_llm_via_litellm(
     Call LLM via litellm for Bedrock/Anthropic providers.
 
     litellm handles the provider-specific API translation automatically.
+    litellm owns its own HTTP stack (no injectable httpx transport), so the
+    uniform retry policy is applied at this call boundary instead — same
+    ``llm_max_retries`` / ``llm_retry_interval`` policy, retrying on ANY
+    error, with clear per-attempt logging. litellm's own retries are
+    disabled (``num_retries=0``) to avoid double-retry stacking.
     """
     import litellm
 
     litellm_model = _get_litellm_model_name(model, config.provider)
+    max_retries, retry_interval = _retry_params(config)
 
     with ProxyDisabledContext():
         if config.provider == "bedrock":
@@ -411,15 +517,39 @@ def _call_llm_via_litellm(
 
         effective_key = api_key or config.llm_api_key
         llm_timeout = getattr(config, 'llm_timeout', DEFAULT_LLM_TIMEOUT)
-        response = litellm.completion(
+        call_kwargs = dict(
             model=litellm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=config.max_tokens,
             api_key=effective_key if config.provider != "bedrock" else None,
             timeout=float(llm_timeout),
+            num_retries=0,
         )
-    return response.choices[0].message.content
+
+        last_exc = None
+        last_desc = "unknown error"
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = litellm.completion(**call_kwargs)
+                return response.choices[0].message.content
+            except Exception as e:  # noqa: BLE001 — retry on ANY failure
+                last_exc = e
+                last_desc = f"{type(e).__name__}: {e}"
+                if attempt < max_retries:
+                    logger.warning(
+                        "[LLM Client] litellm %s attempt %d/%d failed (%s). Retry in %ds...",
+                        litellm_model, attempt, max_retries,
+                        _truncate_error_msg(last_desc, 300), retry_interval,
+                    )
+                    if retry_interval:
+                        time.sleep(retry_interval)
+                else:
+                    logger.error(
+                        "[LLM Client] litellm %s all %d attempts exhausted. Last failure: %s",
+                        litellm_model, max_retries, _truncate_error_msg(last_desc, 500),
+                    )
+        raise last_exc
 
 
 def _call_llm_via_azure(
@@ -443,7 +573,8 @@ def _call_llm_via_azure(
             api_key=api_key or config.llm_api_key,
             api_version=config.api_version,
             azure_endpoint=config.llm_base_url,
-            http_client=_build_proxyless_httpx_client(timeout=llm_timeout),
+            http_client=_build_proxyless_httpx_client(config, timeout=llm_timeout),
+            max_retries=0,  # retry handled uniformly at the httpx transport layer
         )
 
         deployment = config.azure_deployment or model
