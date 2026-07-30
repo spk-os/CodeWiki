@@ -594,7 +594,12 @@ class DocumentationGenerator:
         L0_CACHE_MODEL = "__L0_file_summary__"
 
         def _key_and_src(path):
-            node = file_to_node[path]
+            node = file_to_node.get(path)
+            if node is None:
+                # Path not registered (e.g. an LLM-echoed string that does
+                # not match any real file). No node => no source to hash, so
+                # no stable cache key. Callers must skip caching in this case.
+                return None, ""
             try:
                 src = file_manager.load_text(node.file_path)
             except (FileNotFoundError, IOError, OSError):
@@ -604,11 +609,21 @@ class DocumentationGenerator:
             )
             return key, src
 
+        def _norm(p: str) -> str:
+            """Normalize a path for fuzzy echo-matching (strip whitespace,
+            leading ``./`` and leading ``/``). NOT lowercased — on a
+            case-sensitive filesystem two files may differ only by case."""
+            p = (p or "").strip()
+            while p.startswith("./"):
+                p = p[2:]
+            p = p.lstrip("/")
+            return p
+
         # Pre-fill cache hits so unchanged files never hit the LLM.
         pending = []
         for path in file_paths:
             key, _ = _key_and_src(path)
-            if self.ckpt is not None:
+            if key is not None and self.ckpt is not None:
                 cached = self.ckpt.get_llm_cache(key, L0_CACHE_MODEL)
                 if cached:
                     summaries[path] = cached
@@ -634,15 +649,41 @@ class DocumentationGenerator:
                 logger.error("[L0] batch failed (%s...): %s", batch[0], e)
                 continue
             parsed = self._parse_file_summaries(response, batch)
-            for path, summary in parsed.items():
-                summaries[path] = summary
-                key, _ = _key_and_src(path)
-                if self.ckpt is not None and summary:
-                    self.ckpt.save_llm_cache(key, L0_CACHE_MODEL, summary)
+            # Match the LLM's echoed paths back to the REAL batch paths. The
+            # model is asked to echo the path verbatim but isn't guaranteed
+            # to (it may add "./", change case on a case-insensitive FS, or
+            # emit a path it derived from the source). Cache keys are always
+            # computed from the real batch path — never the echoed string —
+            # so keys stay stable and the source hash is always available.
+            norm_index: Dict[str, str] = {}
+            for p in batch:
+                norm_index.setdefault(_norm(p), p)
+            matched: Dict[str, str] = {}
+            for echoed, summary in parsed.items():
+                target = norm_index.get(_norm(echoed))
+                if target is None and echoed in file_to_node:
+                    target = echoed
+                if target is None:
+                    logger.warning(
+                        "[L0] summary for unrecognized path %r; skipped", echoed
+                    )
+                    continue
+                if target in matched:
+                    continue
+                matched[target] = summary
             # report any files the model skipped so the user sees the gap
             for path in batch:
-                if path not in parsed:
-                    logger.warning("[L0] no summary for %s; leaf will fall back to snippet", path)
+                summary = matched.get(path)
+                if summary is None:
+                    logger.warning(
+                        "[L0] no summary for %s; leaf will fall back to snippet",
+                        path,
+                    )
+                    continue
+                summaries[path] = summary
+                key, _ = _key_and_src(path)
+                if self.ckpt is not None and summary and key is not None:
+                    self.ckpt.save_llm_cache(key, L0_CACHE_MODEL, summary)
         return summaries
 
     @staticmethod
