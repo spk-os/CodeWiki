@@ -70,13 +70,16 @@ class ProxyDisabledContext:
 
 
 class _RetryingHTTPTransport(httpx.BaseTransport):
-    """httpx transport that retries every failed request uniformly.
+    """httpx transport that retries transient LLM-client failures uniformly.
 
-    Retries on ANY transport exception OR any non-2xx response status, up to
-    ``max_retries`` attempts, sleeping a fixed ``retry_interval`` seconds
-    between attempts. There is no error-category distinction: timeouts,
-    connection errors, 4xx and 5xx responses are all retried identically, so
-    no transient failure path can leak past the LLM client un-retried.
+    Retries on ANY transport exception (timeouts, connection resets) and on
+    retriable HTTP statuses — 408 (Request Timeout), 429 (Too Many Requests),
+    and any 5xx.  Other 4xx responses (400 Bad Request, 413 Payload Too Large,
+    401/403/404 …) are **deterministic**: the identical request will fail the
+    same way every time, so retrying only burns wall-clock (a 400 context-
+    overflow would otherwise waste max_retries × retry_interval seconds before
+    surfacing).  Such responses are returned immediately so the openai SDK can
+    raise a proper, fast status error.
 
     Installing the retry policy at the httpx transport (client) layer — rather
     than per call site — guarantees the SAME policy covers every code path
@@ -84,6 +87,10 @@ class _RetryingHTTPTransport(httpx.BaseTransport):
     ``call_llm`` calls, pydantic-ai agent runs, and azure clients alike.
     Each failed attempt and the final exhaustion are logged clearly.
     """
+
+    # HTTP statuses worth retrying (the request may yet succeed unchanged):
+    # 408 timeout, 429 rate-limit, and all 5xx (transient server faults).
+    _RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
     def __init__(self, max_retries: int, retry_interval: int) -> None:
         self._max_retries = max(1, int(max_retries))
@@ -104,7 +111,7 @@ class _RetryingHTTPTransport(httpx.BaseTransport):
                 if response.status_code < 400:
                     return response
                 # Non-2xx: read body once for a readable log line, then free
-                # the connection before retrying.
+                # the connection before deciding whether to retry.
                 err_desc = f"HTTP {response.status_code}"
                 try:
                     response.read()
@@ -114,6 +121,15 @@ class _RetryingHTTPTransport(httpx.BaseTransport):
                 except Exception:
                     pass
                 last_error = err_desc
+                # Deterministic 4xx (not 408/429): the same request will fail
+                # identically every time — surface it now instead of retrying.
+                if response.status_code not in self._RETRIABLE_STATUSES:
+                    logger.warning(
+                        "[LLM Client] %s failed (%s). Not retried "
+                        "(deterministic 4xx).",
+                        url, _truncate_error_msg(last_error, 300),
+                    )
+                    return response
             except Exception as e:  # noqa: BLE001 — retry on ANY failure
                 response = None
                 last_error = f"{type(e).__name__}: {e}"
@@ -147,6 +163,8 @@ class _RetryingHTTPTransport(httpx.BaseTransport):
 class _RetryingAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """Async twin of :class:`_RetryingHTTPTransport` (see its docstring)."""
 
+    _RETRIABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
     def __init__(self, max_retries: int, retry_interval: int) -> None:
         self._max_retries = max(1, int(max_retries))
         self._retry_interval = max(0, int(retry_interval))
@@ -171,6 +189,14 @@ class _RetryingAsyncHTTPTransport(httpx.AsyncBaseTransport):
                 except Exception:
                     pass
                 last_error = err_desc
+                # Deterministic 4xx (not 408/429): surface now, do not retry.
+                if response.status_code not in self._RETRIABLE_STATUSES:
+                    logger.warning(
+                        "[LLM Client] %s failed (%s). Not retried "
+                        "(deterministic 4xx).",
+                        url, _truncate_error_msg(last_error, 300),
+                    )
+                    return response
             except Exception as e:  # noqa: BLE001 — retry on ANY failure
                 response = None
                 last_error = f"{type(e).__name__}: {e}"
