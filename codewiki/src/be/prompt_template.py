@@ -367,6 +367,13 @@ def _format_condensed_components(
     Per file: L0 summary (if available) + per-component signature card +
     call-graph edges.  Falls back to a short source snippet (first N chars)
     when no L0 summary exists, so a file is never silently empty.
+
+    The WHOLE body is bounded by ``max_content_tokens`` (tokens): summaries,
+    signature cards, call-graph lines and fallback snippets all count toward
+    it.  Once exhausted, remaining files are skipped with a one-line
+    truncation notice — so a batch covering a giant module can never blow the
+    big model's context window.  A budget of 0 means unlimited (used when the
+    caller does not pass a context window).
     """
     from codewiki.src.be.utils import count_tokens
 
@@ -374,6 +381,14 @@ def _format_condensed_components(
     rev = reverse_call_index or {}
     parts = []
     used_tokens = 0
+    # Stop adding content at 90% of the budget, leaving headroom for the
+    # wrapper, module tree and the model's response.
+    cap = int(max_content_tokens * 0.9) if max_content_tokens > 0 else 0
+    truncated_files = 0
+
+    def _beyond_budget(extra_tokens: int = 0) -> bool:
+        # No cap => never truncate.
+        return cap > 0 and (used_tokens + extra_tokens) > cap
 
     # Call-graph section across this module's components.
     graph_lines = []
@@ -391,31 +406,56 @@ def _format_condensed_components(
                     line += f"  (called by: {callers})"
                 graph_lines.append(line)
     if graph_lines:
-        parts.append("## Call Graph (component dependencies)\n" + "\n".join(graph_lines) + "\n")
+        graph_block = "## Call Graph (component dependencies)\n" + "\n".join(graph_lines) + "\n"
+        gt = count_tokens(graph_block)
+        if not _beyond_budget(gt):
+            parts.append(graph_block)
+            used_tokens += gt
 
     for path, cids in grouped_components.items():
-        parts.append(f"# File: {path}")
+        # Once over budget, just count the rest as truncated and move on.
+        if _beyond_budget():
+            truncated_files += 1
+            continue
+        file_block_parts = [f"# File: {path}"]
         summary = l0.get(path)
         if summary:
-            parts.append(f"## File Summary (L0)\n{summary}\n")
+            summary_block = f"## File Summary (L0)\n{summary}\n"
+            file_block_parts.append(summary_block)
         for cid in cids:
             node = components.get(cid)
             if node:
-                parts.append(_format_signature_card(node))
+                file_block_parts.append(_format_signature_card(node))
         # Fallback snippet when no L0 summary: first chunk of source so the
         # big model is never blind to a file it must document.
         if not summary and cids:
             node = components.get(cids[0])
             if node and node.source_code:
-                budget = max_content_tokens - used_tokens
-                if budget > 200:
-                    char_budget = min(len(node.source_code), budget * 4)
+                remaining = cap - used_tokens if cap > 0 else len(node.source_code) // 4
+                if remaining > 200:
+                    char_budget = min(len(node.source_code), remaining * 4)
                     snippet = node.source_code[:char_budget]
                     if char_budget < len(node.source_code):
                         snippet += "\n# ... (snippet; full source via read_code_components)\n"
-                    parts.append(f"## Source snippet (no L0 summary):\n```\n{snippet}\n```\n")
-                    used_tokens += count_tokens(snippet)
-        parts.append("")
+                    file_block_parts.append(
+                        f"## Source snippet (no L0 summary):\n```\n{snippet}\n```\n"
+                    )
+        file_block = "\n".join(file_block_parts) + "\n"
+        ft = count_tokens(file_block)
+        # If this single file alone pushes past the cap, emit it only if we
+        # still have meaningful room; otherwise count it as truncated so the
+        # notice is accurate.
+        if _beyond_budget(ft) and used_tokens > 0:
+            truncated_files += 1
+            continue
+        parts.append(file_block)
+        used_tokens += ft
+
+    if truncated_files:
+        parts.append(
+            f"# Note: {truncated_files} additional file(s) omitted to fit "
+            f"within the {max_content_tokens}-token content budget.\n"
+        )
 
     return "\n".join(parts)
 
@@ -441,34 +481,15 @@ def format_l0_batch_prompt(file_paths: list[str], components: Dict[str, Any]) ->
     )
 
 
-def format_user_prompt(
-    module_name: str,
-    core_component_ids: list[str],
-    components: Dict[str, Any],
-    module_tree: dict[str, any],
-    context_window: int = 0,
-    condensed: bool = False,
-    l0_summaries: dict = None,
-    reverse_call_index: dict = None,
-) -> str:
-    """Format the user prompt with module name and organized core component codes.
-
-    Args:
-        module_name: Name of the module to document
-        core_component_ids: List of component IDs to include
-        components: Dictionary mapping component IDs to CodeComponent objects
-        module_tree: Module tree structure for context
-        context_window: Maximum model context window in tokens (0 = unlimited).
-            When set, file content is truncated to stay within the limit.
-    """
-
-    from codewiki.src.be.utils import count_tokens
-
-    # format module tree
+def _render_module_tree(module_tree: dict[str, any], module_name: str = "") -> str:
+    """Render the full module tree as an indented string, marking the current
+    module.  Extracted so fast-batch mode can render it ONCE for the whole
+    batch instead of once per module (a 600-module tree is the dominant token
+    cost and would otherwise be duplicated N times in one batch prompt)."""
     lines = []
-    
-    def _format_module_tree(module_tree: dict[str, any], indent: int = 0):
-        for key, value in module_tree.items():
+
+    def _walk(nodes: dict[str, any], indent: int = 0):
+        for key, value in nodes.items():
             if key == module_name:
                 lines.append(f"{'  ' * indent}{key} (current module)")
             else:
@@ -489,10 +510,46 @@ def format_user_prompt(
 
             if isinstance(value["children"], dict) and len(value["children"]) > 0:
                 lines.append(f"{'  ' * (indent + 1)} Children:")
-                _format_module_tree(value["children"], indent + 2)
+                _walk(value["children"], indent + 2)
 
-    _format_module_tree(module_tree, 0)
-    formatted_module_tree = "\n".join(lines)
+    _walk(module_tree, 0)
+    return "\n".join(lines)
+
+
+def format_user_prompt(
+    module_name: str,
+    core_component_ids: list[str],
+    components: Dict[str, Any],
+    module_tree: dict[str, any],
+    context_window: int = 0,
+    condensed: bool = False,
+    l0_summaries: dict = None,
+    reverse_call_index: dict = None,
+    render_module_tree: bool = True,
+) -> str:
+    """Format the user prompt with module name and organized core component codes.
+
+    Args:
+        module_name: Name of the module to document
+        core_component_ids: List of component IDs to include
+        components: Dictionary mapping component IDs to CodeComponent objects
+        module_tree: Module tree structure for context
+        context_window: Maximum model context window in tokens (0 = unlimited).
+            When set, file content is truncated to stay within the limit.
+        render_module_tree: When False, the (potentially huge) full module
+            tree is omitted from this prompt — the caller is expected to emit
+            it once for the whole batch instead (fast batch mode).  Rendering a
+            600-module tree inside every per-module prompt is the dominant
+            token cost and would blow the context window on its own.
+    """
+
+    from codewiki.src.be.utils import count_tokens
+
+    if render_module_tree:
+        formatted_module_tree = _render_module_tree(module_tree, module_name)
+    else:
+        # The shared tree is emitted once by format_fast_batch_user_prompt.
+        formatted_module_tree = "(see the shared module tree above)"
 
     # Group core component IDs by their file path
     grouped_components: dict[str, list[str]] = {}
@@ -699,7 +756,24 @@ def format_fast_batch_user_prompt(
     module is rendered via :func:`format_user_prompt` (which already embeds the
     component source code, truncated to the context window) and wrapped in a
     ``<MODULE_BATCH_ITEM>`` tag so the model can map outputs back to modules.
+
+    When ``context_window`` is set, it is split **evenly across the modules in
+    the batch** (each module gets ``0.6 × context_window / len(modules)``
+    tokens of content budget) so the assembled batch stays within a single
+    context window — without this, N modules each allowed 0.6×context would
+    together blow the limit.
     """
+    # Split the content budget evenly across modules so the whole batch
+    # (sum of per-module bodies) fits in one context window.
+    n_modules = max(1, len(modules))
+    if context_window > 0:
+        per_module_context = max(1, int(context_window * 0.6) // n_modules)
+    else:
+        per_module_context = 0
+    # Render the (potentially huge) full module tree ONCE for the whole batch.
+    # Rendering it per module would duplicate a 600-module tree N times and
+    # alone blow the context window.
+    shared_tree = _render_module_tree(module_tree)
     items = []
     for module_name, core_component_ids in modules:
         if not core_component_ids:
@@ -710,10 +784,11 @@ def format_fast_batch_user_prompt(
                 core_component_ids=core_component_ids,
                 components=components,
                 module_tree=module_tree,
-                context_window=context_window,
+                context_window=per_module_context,
                 condensed=condensed,
                 l0_summaries=l0_summaries,
                 reverse_call_index=reverse_call_index,
+                render_module_tree=False,
             )
         items.append(f'<MODULE_BATCH_ITEM name="{module_name}">\n{body}\n</MODULE_BATCH_ITEM>')
 
@@ -721,6 +796,7 @@ def format_fast_batch_user_prompt(
         f"Generate documentation for each of the {len(modules)} modules below. "
         "Emit one <MODULE_DOC name=\"...\"> block per module, in any order, "
         "using the EXACT module name from each <MODULE_BATCH_ITEM>.\n\n"
+        f"<SHARED_MODULE_TREE>\n{shared_tree}\n</SHARED_MODULE_TREE>\n\n"
         + "\n\n".join(items)
     )
 
